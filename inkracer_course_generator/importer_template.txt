@@ -1,0 +1,928 @@
+import bpy
+import json
+import math
+import hashlib
+import base64
+import os
+import struct
+import tempfile
+from mathutils import Matrix, Vector
+
+
+def _node(tree, name, kind):
+    """既定ノードを名前で探し、無ければ種類で探す（日本語 UI で名前が翻訳されている場合に対応）"""
+    node = tree.nodes.get(name)
+    if node is None:
+        node = next((n for n in tree.nodes if n.type == kind), None)
+    return node
+
+import bpy
+from mathutils import Vector
+
+
+def ink_operations(group):
+    def operation(op, a, b=0):
+        node = group.nodes.new("CompositorNodeMath")
+        node.operation = op
+        for socket, value in zip(node.inputs, (a, b)):
+            if isinstance(value, (int, float)): socket.default_value = value
+            else: group.links.new(value, socket)
+        return node.outputs[0]
+
+    def smoothstep(a, b, value):
+        t = operation("MINIMUM", operation("MAXIMUM", operation("DIVIDE", operation("SUBTRACT", value, a), operation("SUBTRACT", b, a)), 0), 1)
+        return operation("MULTIPLY", operation("MULTIPLY", t, t), operation("SUBTRACT", 3, operation("MULTIPLY", t, 2)))
+    return operation, smoothstep
+
+
+def create_ink_halftone(scene, new_data, prefix):
+    # Native compositor data survives .blend saves without Python render handlers.
+    textures = []
+    for vertical in (False, True):
+        texture = new_data(bpy.data.textures, prefix + ("Ink screen Y" if vertical else "Ink screen X"), "BLEND")
+        texture.progression = "LINEAR"
+        texture.use_flip_axis = "VERTICAL" if vertical else "HORIZONTAL"
+        textures.append(texture)
+    group = new_data(bpy.data.node_groups, prefix + "Ink Halftone", "CompositorNodeTree")
+    shade_socket = group.interface.new_socket(name="Shade", in_out="INPUT", socket_type="NodeSocketFloat")
+    shade_socket.default_value, shade_socket.min_value, shade_socket.max_value = .4, 0, .82
+    group.interface.new_socket(name="Mask", in_out="OUTPUT", socket_type="NodeSocketFloat")
+    inputs = group.nodes.new("NodeGroupInput")
+    output = group.nodes.new("NodeGroupOutput")
+
+    operation, smoothstep = ink_operations(group)
+
+    def dimension_driver(socket, dimension, expression):
+        driver = socket.driver_add("default_value").driver
+        for name, path in (("size", "render." + dimension), ("percent", "render.resolution_percentage")):
+            variable = driver.variables.new()
+            variable.name, variable.type = name, "SINGLE_PROP"
+            variable.targets[0].id_type = "SCENE"
+            variable.targets[0].id = scene
+            variable.targets[0].data_path = path
+        driver.expression = expression
+
+    cells = []
+    for texture, dimension in zip(textures, ("resolution_x", "resolution_y")):
+        node = group.nodes.new("CompositorNodeTexture")
+        node.texture = texture
+        axis = operation("ADD", node.outputs["Value"], 0)
+        dimension_driver(axis.node.inputs[1], dimension, "0.5/max(1,floor(size*percent/100))")
+        grid = operation("MULTIPLY", axis, 1)
+        dimension_driver(grid.node.inputs[1], dimension, "max(1,floor(size*percent/100))/5")
+        cells.append(operation("SUBTRACT", operation("FRACT", grid), .5))
+    x, y = cells
+    radius = operation("SQRT", operation("ADD", operation("MULTIPLY", x, x), operation("MULTIPLY", y, y)))
+    shade = inputs.outputs["Shade"]
+    dot_radius = operation("ADD", .03, operation("MULTIPLY", .2, smoothstep(.2, .75, shade)))
+    dots = operation("MULTIPLY", operation("SUBTRACT", 1, smoothstep(dot_radius, operation("ADD", dot_radius, .1), radius)), smoothstep(.13, .5, shade))
+    group.links.new(dots, output.inputs["Mask"])
+    return group
+
+
+def create_ink_paper(new_data, prefix, style, night, halftone):
+    # Base pigment stage of InkRenderer; geometry-derived masks are separate inputs.
+    group = new_data(bpy.data.node_groups, prefix + "Ink Paper", "CompositorNodeTree")
+    group.interface.new_socket(name="Image", in_out="INPUT", socket_type="NodeSocketColor")
+    for name in ("Hatch", "Ground", "Edge", "Background"):
+        socket = group.interface.new_socket(name=name, in_out="INPUT", socket_type="NodeSocketFloat")
+        socket.default_value = 0
+    group.interface.new_socket(name="Image", in_out="OUTPUT", socket_type="NodeSocketColor")
+    group.interface.new_socket(name="Paper", in_out="OUTPUT", socket_type="NodeSocketColor")
+    group.interface.new_socket(name="Coverage", in_out="OUTPUT", socket_type="NodeSocketFloat")
+    inputs, output = group.nodes.new("NodeGroupInput"), group.nodes.new("NodeGroupOutput")
+    operation, smoothstep = ink_operations(group)
+    channels = group.nodes.new("CompositorNodeSepRGBA")
+    group.links.new(inputs.outputs["Image"], channels.inputs[0])
+    r, g, b = (channels.outputs[name] for name in ("R", "G", "B"))
+    lum = operation("ADD", operation("ADD", operation("MULTIPLY", r, .2126), operation("MULTIPLY", g, .7152)), operation("MULTIPLY", b, .0722))
+    light = smoothstep(.012, .38, operation("MULTIPLY", lum, night["brightness"]))
+    shade = operation("SUBTRACT", .72, operation("MULTIPLY", light, .66)) if night["enabled"] else operation("MINIMUM", operation("MAXIMUM", operation("MULTIPLY", operation("SUBTRACT", .78, lum), .9), 0), .82)
+    dots = group.nodes.new("CompositorNodeGroup")
+    dots.node_tree = halftone
+    group.links.new(shade, dots.inputs["Shade"])
+    pattern = style["pattern"]
+    coverage = operation("ADD", operation("MULTIPLY", shade, .12), operation("ADD", operation("MULTIPLY", inputs.outputs["Hatch"], 0 if pattern == "halftone" else .68), operation("MULTIPLY", dots.outputs["Mask"], 0 if pattern == "hatch" else 1.5 if pattern == "halftone" else .30)))
+    coverage = operation("MINIMUM", operation("MAXIMUM", coverage, 0), .85)
+    coverage = operation("ADD", operation("MULTIPLY", coverage, operation("SUBTRACT", 1, inputs.outputs["Ground"])), operation("MULTIPLY", operation("MULTIPLY", shade, .35), inputs.outputs["Ground"]))
+    coverage = operation("MULTIPLY", coverage, operation("SUBTRACT", 1, inputs.outputs["Background"]))
+    red = operation("MULTIPLY", smoothstep(1.25, 1.8, operation("DIVIDE", r, operation("MAXIMUM", g, .01))), smoothstep(1.25, 1.8, operation("DIVIDE", r, operation("MAXIMUM", b, .01))))
+
+    def color(hex_value):
+        return tuple(int(hex_value[i:i+2], 16)/255 for i in (1,3,5)) + (1,)
+
+    def mix(factor, a, b):
+        node = group.nodes.new("CompositorNodeMixRGB")
+        for socket, value in zip(node.inputs, (factor, a, b)):
+            if isinstance(value, tuple): socket.default_value = value
+            elif isinstance(value, (int, float)): socket.default_value = value
+            else: group.links.new(value, socket)
+        return node.outputs[0]
+
+    paper, ink, accent = (color(style[key]) for key in ("paper", "ink", "accent"))
+    if night["enabled"]:
+        paper = mix(operation("ADD", .50, operation("MULTIPLY", light, .45)), (0,0,0,1), paper)
+    pigment = mix(operation("MULTIPLY", red, .75), ink, accent)
+    result = mix(coverage, paper, pigment)
+    result = mix(operation("MULTIPLY", operation("MULTIPLY", inputs.outputs["Edge"], .92), operation("SUBTRACT",1,inputs.outputs["Background"])), result, ink)
+    group.links.new(result, output.inputs["Image"])
+    if isinstance(paper,tuple): output.inputs["Paper"].default_value = paper
+    else: group.links.new(paper,output.inputs["Paper"])
+    group.links.new(coverage,output.inputs["Coverage"])
+    return group
+
+
+def create_ink_hatch(scene, new_data, prefix, halftone):
+    group = new_data(bpy.data.node_groups, prefix + "Ink Hatch", "CompositorNodeTree")
+    for name in ("Position", "Normal"):
+        group.interface.new_socket(name=name, in_out="INPUT", socket_type="NodeSocketVector")
+    group.interface.new_socket(name="Shade", in_out="INPUT", socket_type="NodeSocketFloat").default_value = .4
+    for name in ("Hatch", "Ground"):
+        group.interface.new_socket(name=name, in_out="OUTPUT", socket_type="NodeSocketFloat")
+    inputs, output = group.nodes.new("NodeGroupInput"), group.nodes.new("NodeGroupOutput")
+    op, smooth = ink_operations(group)
+    vectors = []
+    for name in ("Position", "Normal"):
+        node = group.nodes.new("CompositorNodeSeparateXYZ")
+        group.links.new(inputs.outputs[name], node.inputs[0])
+        vectors.append([node.outputs[key] for key in ("X", "Y", "Z")])
+    px, py, pz = vectors[0]
+    nx, ny, nz = [op("ABSOLUTE", value) for value in vectors[1]]
+    ground = op("GREATER_THAN", ny, op("MAXIMUM", nx, nz))
+    wall = op("GREATER_THAN", nx, nz)
+
+    def mix(a, b, t):
+        return op("ADD", op("MULTIPLY", a, op("SUBTRACT", 1, t)), op("MULTIPLY", b, t))
+
+    u, v = mix(mix(px, pz, wall), px, ground), mix(py, pz, ground)
+    textures = [node.texture for node in halftone.nodes if node.bl_idname == "CompositorNodeTexture"]
+    parities = []
+    for texture, dimension in zip(textures, ("resolution_x", "resolution_y")):
+        node = group.nodes.new("CompositorNodeTexture")
+        node.texture = texture
+        pixel = op("MULTIPLY", node.outputs["Value"], 1)
+        driver = pixel.node.inputs[1].driver_add("default_value").driver
+        for name, path in (("size", "render."+dimension), ("percent", "render.resolution_percentage")):
+            variable = driver.variables.new()
+            variable.name, variable.type = name, "SINGLE_PROP"
+            variable.targets[0].id_type = "SCENE"
+            variable.targets[0].id = scene
+            variable.targets[0].data_path = path
+        driver.expression = "max(1,floor(size*percent/100))"
+        parities.append(op("MODULO", op("FLOOR", op("ADD", pixel, .25)), 2))
+
+    def line(coordinate):
+        derivatives = []
+        # Match fragment-quad derivatives instead of blurring surface-space marks.
+        for axis, parity in enumerate(parities):
+            samples = []
+            for shift in (-1, 1):
+                translate = group.nodes.new("CompositorNodeTranslate")
+                group.links.new(coordinate, translate.inputs[0])
+                translate.inputs[axis+1].default_value = shift
+                samples.append(op("ABSOLUTE", op("SUBTRACT", coordinate, translate.outputs[0])))
+            derivatives.append(mix(samples[0], samples[1], parity))
+        fw = op("MAXIMUM", op("ADD", *derivatives), .001)
+        distance = op("ABSOLUTE", op("SUBTRACT", op("FRACT", coordinate), .5))
+        half = op("MULTIPLY", fw, .5)
+        mark = op("SUBTRACT", 1, smooth(op("SUBTRACT", .045, half), op("ADD", .045, half), distance))
+        return mix(mark, .09, smooth(.45, 1.5, fw))
+
+    a = line(op("ADD", op("MULTIPLY", op("ADD", u, v), 3.4), op("MULTIPLY", op("SINE", op("MULTIPLY", v, 8)), .055)))
+    b = line(op("ADD", op("MULTIPLY", op("SUBTRACT", u, v), 3.6), op("MULTIPLY", op("SINE", op("MULTIPLY", u, 7)), .04)))
+    shade = inputs.outputs["Shade"]
+    hatch = op("ADD", op("MULTIPLY", a, smooth(.06,.25,shade)), op("MULTIPLY", op("MULTIPLY", b, smooth(.30,.58,shade)), .85))
+    group.links.new(hatch, output.inputs["Hatch"])
+    group.links.new(smooth(.75,.95,ny), output.inputs["Ground"])
+    return group
+
+
+def create_ink_geometry(new_data, prefix, night, hatch_group, paper_group):
+    group = new_data(bpy.data.node_groups, prefix + "Ink Geometry", "CompositorNodeTree")
+    group.interface.new_socket(name="Image", in_out="INPUT", socket_type="NodeSocketColor")
+    for name in ("Position", "Normal"):
+        group.interface.new_socket(name=name, in_out="INPUT", socket_type="NodeSocketVector").description = "Source Y-up coordinates; position in meters"
+    group.interface.new_socket(name="Edge", in_out="INPUT", socket_type="NodeSocketFloat").default_value = 0
+    group.interface.new_socket(name="Background", in_out="INPUT", socket_type="NodeSocketFloat").default_value = 0
+    group.interface.new_socket(name="Image", in_out="OUTPUT", socket_type="NodeSocketColor")
+    group.interface.new_socket(name="Paper", in_out="OUTPUT", socket_type="NodeSocketColor")
+    group.interface.new_socket(name="Coverage", in_out="OUTPUT", socket_type="NodeSocketFloat")
+    inputs, output = group.nodes.new("NodeGroupInput"), group.nodes.new("NodeGroupOutput")
+    op, smooth = ink_operations(group)
+    channels = group.nodes.new("CompositorNodeSepRGBA")
+    group.links.new(inputs.outputs["Image"], channels.inputs[0])
+    r,g,b = (channels.outputs[key] for key in ("R","G","B"))
+    lum = op("ADD",op("ADD",op("MULTIPLY",r,.2126),op("MULTIPLY",g,.7152)),op("MULTIPLY",b,.0722))
+    shade = op("SUBTRACT",.72,op("MULTIPLY",smooth(.012,.38,op("MULTIPLY",lum,night["brightness"])),.66)) if night["enabled"] else op("MINIMUM",op("MAXIMUM",op("MULTIPLY",op("SUBTRACT",.78,lum),.9),0),.82)
+    hatch = group.nodes.new("CompositorNodeGroup")
+    hatch.node_tree = hatch_group
+    for key in ("Position","Normal"): group.links.new(inputs.outputs[key],hatch.inputs[key])
+    group.links.new(shade,hatch.inputs["Shade"])
+    paper = group.nodes.new("CompositorNodeGroup")
+    paper.node_tree = paper_group
+    for key in ("Image","Edge","Background"): group.links.new(inputs.outputs[key],paper.inputs[key])
+    for key in ("Hatch","Ground"): group.links.new(hatch.outputs[key],paper.inputs[key])
+    for key in ("Image","Paper","Coverage"): group.links.new(paper.outputs[key],output.inputs[key])
+    return group
+
+
+def create_ink_page(scene,new_data,prefix,style,halftone):
+    group = new_data(bpy.data.node_groups,prefix + "Ink Page","CompositorNodeTree")
+    for name in ("Image","Paper"):
+        group.interface.new_socket(name=name,in_out="INPUT",socket_type="NodeSocketColor")
+    for name in ("Coverage","Edge"):
+        group.interface.new_socket(name=name,in_out="INPUT",socket_type="NodeSocketFloat").default_value = 0
+    group.interface.new_socket(name="Image",in_out="OUTPUT",socket_type="NodeSocketColor")
+    group.interface.new_socket(name="Grain",in_out="OUTPUT",socket_type="NodeSocketFloat")
+    inputs,output = group.nodes.new("NodeGroupInput"),group.nodes.new("NodeGroupOutput")
+    op,smooth = ink_operations(group)
+    screen = []
+    textures = [node.texture for node in halftone.nodes if node.bl_idname=="CompositorNodeTexture"]
+    for texture,dimension in zip(textures,("resolution_x","resolution_y")):
+        node = group.nodes.new("CompositorNodeTexture")
+        node.texture = texture
+        pixels = op("MULTIPLY",node.outputs["Value"],1)
+        driver = pixels.node.inputs[1].driver_add("default_value").driver
+        for name,path in (("size","render."+dimension),("percent","render.resolution_percentage")):
+            variable = driver.variables.new()
+            variable.name,variable.type = name,"SINGLE_PROP"
+            variable.targets[0].id_type = "SCENE"
+            variable.targets[0].id = scene
+            variable.targets[0].data_path = path
+        driver.expression = "max(1,floor(size*percent/100))"
+        screen.append(op("ADD",pixels,.5))
+    x,y = screen
+    hashed = op("FRACT",op("MULTIPLY",op("SINE",op("ADD",op("MULTIPLY",op("FLOOR",op("MULTIPLY",x,1.4)),127.1),op("MULTIPLY",op("FLOOR",op("MULTIPLY",y,1.4)),311.7))),43758.5453))
+    grain = op("MULTIPLY",op("SUBTRACT",hashed,.5),.025)
+
+    def mix(factor,a,b,blend="MIX"):
+        node = group.nodes.new("CompositorNodeMixRGB")
+        node.blend_type = blend
+        for socket,value in zip(node.inputs,(factor,a,b)):
+            if isinstance(value,(int,float,tuple)): socket.default_value = value
+            else: group.links.new(value,socket)
+        return node.outputs[0]
+
+    ink,accent = (tuple(int(style[key][i:i+2],16)/255 for i in (1,3,5))+(1,) for key in ("ink","accent"))
+    weight = op("MULTIPLY",op("SUBTRACT",1,inputs.outputs["Coverage"]),op("SUBTRACT",1,op("MULTIPLY",inputs.outputs["Edge"],.92)))
+    result = mix(1,inputs.outputs["Image"],op("MULTIPLY",grain,weight),"ADD")
+    paper = mix(1,inputs.outputs["Paper"],grain,"ADD")
+    ruled = op("SUBTRACT",1,smooth(.45,1.1,op("ABSOLUTE",op("SUBTRACT",op("MODULO",y,62),31))))
+    result = mix(op("MULTIPLY",ruled,.45),result,mix(.30,paper,ink))
+    margin = op("SUBTRACT",1,smooth(.45,1.3,op("ABSOLUTE",op("SUBTRACT",x,54))))
+    result = mix(op("MULTIPLY",margin,.2),result,accent)
+    group.links.new(result,output.inputs["Image"])
+    group.links.new(grain,output.inputs["Grain"])
+    return group
+
+
+def create_ink_preview(source, course, root, payload, new_data, prefix):
+    preview = new_data(bpy.data.scenes, prefix + "手描きレンダー")
+    preview.collection.children.link(course)  # Share the geometry, never duplicate the map.
+    preview.world = source.world
+    for key in ("system", "scale_length", "length_unit"):
+        setattr(preview.unit_settings,key,getattr(source.unit_settings,key))
+    for key in ("resolution_x", "resolution_y", "resolution_percentage", "fps", "fps_base"):
+        setattr(preview.render,key,getattr(source.render,key))
+    preview.render.engine = "CYCLES"
+    preview.cycles.samples = 64
+    preview.cycles.use_animated_seed = False
+    preview.frame_end = source.frame_end
+    preview.view_settings.view_transform = "Raw"
+    preview.view_settings.exposure = 0
+    preview.use_nodes = True
+    layer = preview.view_layers[0]
+    layer.use_pass_position = layer.use_pass_normal = layer.use_pass_z = True
+    tree = preview.node_tree
+    tree.execution_mode = "TILED"
+    tree.use_groupnode_buffer = True
+    tree.nodes.clear()
+    rendered = tree.nodes.new("CompositorNodeRLayers")
+    rendered.scene = preview
+    rendered.layer = layer.name
+    preview_prefix = prefix + "Preview | "
+    dots = create_ink_halftone(preview,new_data,preview_prefix)
+    paper = create_ink_paper(new_data,preview_prefix,payload["inkStyle"],payload["night"],dots)
+    hatch = create_ink_hatch(preview,new_data,preview_prefix,dots)
+    geometry = create_ink_geometry(new_data,preview_prefix,payload["night"],hatch,paper)
+    page_group = create_ink_page(preview,new_data,preview_prefix,payload["inkStyle"],dots)
+    for group in (dots,paper,hatch,geometry,page_group): group["ink_racer_preview_scene"] = preview
+    ink = tree.nodes.new("CompositorNodeGroup")
+    ink.node_tree = geometry
+    tree.links.new(rendered.outputs["Image"],ink.inputs["Image"])
+    op, _ = ink_operations(tree)
+    coordinates = new_data(bpy.data.node_groups,preview_prefix + "Source Coordinates","CompositorNodeTree")
+    coordinates["ink_racer_preview_scene"] = preview
+    for name in ("Position","Normal"):
+        coordinates.interface.new_socket(name=name,in_out="INPUT",socket_type="NodeSocketVector")
+        coordinates.interface.new_socket(name=name,in_out="OUTPUT",socket_type="NodeSocketVector")
+    coordinate_input = coordinates.nodes.new("NodeGroupInput")
+    coordinate_output = coordinates.nodes.new("NodeGroupOutput")
+    coordinate_op, _ = ink_operations(coordinates)
+    mapping = tree.nodes.new("CompositorNodeGroup")
+    mapping.node_tree = coordinates
+    for key,matrix in (("Position",root.matrix_world.inverted()),("Normal",root.matrix_world.transposed())):
+        tree.links.new(rendered.outputs[key],mapping.inputs[key])
+        separate = coordinates.nodes.new("CompositorNodeSeparateXYZ")
+        coordinates.links.new(coordinate_input.outputs[key],separate.inputs[0])
+        channels = [separate.outputs[name] for name in ("X","Y","Z")]
+        values = []
+        for row in range(3):
+            value = coordinate_op("ADD",coordinate_op("ADD",coordinate_op("MULTIPLY",channels[0],matrix[row][0]),coordinate_op("MULTIPLY",channels[1],matrix[row][1])),coordinate_op("MULTIPLY",channels[2],matrix[row][2]))
+            values.append(coordinate_op("ADD",value,matrix[row][3]) if key=="Position" else value)
+        if key=="Normal":
+            length = coordinate_op("MAXIMUM",coordinate_op("SQRT",coordinate_op("ADD",coordinate_op("ADD",coordinate_op("MULTIPLY",values[0],values[0]),coordinate_op("MULTIPLY",values[1],values[1])),coordinate_op("MULTIPLY",values[2],values[2]))),.000001)
+            values = [coordinate_op("DIVIDE",value,length) for value in values]
+        combined = coordinates.nodes.new("CompositorNodeCombineXYZ")
+        for value,socket in zip(values,combined.inputs): coordinates.links.new(value,socket)
+        coordinates.links.new(combined.outputs[0],coordinate_output.inputs[key])
+        tree.links.new(mapping.outputs[key],ink.inputs[key])
+    tree.links.new(op("GREATER_THAN",rendered.outputs["Depth"],1e9),ink.inputs["Background"])
+    composite = tree.nodes.new("CompositorNodeComposite")
+    page = tree.nodes.new("CompositorNodeGroup")
+    page.node_tree = page_group
+    for key in ("Image","Paper","Coverage"): tree.links.new(ink.outputs[key],page.inputs[key])
+    tree.links.new(page.outputs["Image"],composite.inputs[0])
+    camera_data = new_data(bpy.data.cameras,preview_prefix + "Camera")
+    camera_data.lens = 32
+    camera_data.clip_start = .1/source.unit_settings.scale_length
+    camera_data.clip_end = 10000/source.unit_settings.scale_length
+    camera = new_data(bpy.data.objects,preview_prefix + "Camera",camera_data)
+    preview.collection.objects.link(camera)
+    camera.parent = root
+    points = payload["points"]
+    origin = Vector(tuple(points[0][axis] for axis in ("x","y","z")))
+    forward = Vector(tuple(points[min(2,len(points)-1)][axis] for axis in ("x","y","z"))) - origin
+    forward.y = 0
+    forward.normalize()
+    camera.location = origin + Vector((0,3,0))
+    direction = root.matrix_world.to_3x3() @ (forward*35 + Vector((0,-1,0)))
+    camera.rotation_euler = (root.matrix_world.to_quaternion().inverted() @ direction.to_track_quat("-Z","Y")).to_euler()
+    preview.camera = camera
+    return preview
+
+
+def remove_ink_preview(course):
+    preview = course.get("ink_racer_preview_scene")
+    if preview is None or course.users > 2:
+        return
+    groups = {g for g in bpy.data.node_groups if g.get("ink_racer_preview_scene") == preview}
+    allowed = groups | {course,preview,preview.node_tree}
+    users = bpy.data.user_map(subset=groups | {preview})
+    if any(set(refs)-allowed for refs in users.values()):
+        return  # A user's compositor references this preview; retain it with the old map.
+    for obj in list(preview.collection.objects):
+        if obj.get("ink_racer_id") != course.get("ink_racer_id"):
+            continue
+        if len(obj.users_collection)>1:
+            matrix = obj.matrix_world.copy()
+            obj.parent = None
+            obj.matrix_world = matrix
+        else:
+            data = obj.data
+            bpy.data.objects.remove(obj,do_unlink=True)
+            if data is not None and data.users==0 and isinstance(data,bpy.types.Camera): bpy.data.cameras.remove(data)
+    del course["ink_racer_preview_scene"]
+    bpy.data.scenes.remove(preview)
+
+
+# InkRacer environment export includes animated scenery. Runtime particles, replay trails and the player car are excluded.
+SCENE = __INKRACER_SCENE__
+COLLECTION_NAME = __INKRACER_COLLECTION__
+MATERIAL_PREFIX = "IR " + hashlib.sha256(SCENE["id"].encode("utf-8")).hexdigest()[:16] + " | "
+
+# Validate the complete payload before removing an existing course.
+def finite_values(values, label):
+    if not all(type(v) in (int, float) and math.isfinite(v) for v in values):
+        raise ValueError("Invalid numeric data: " + label)
+
+ink_style = SCENE.get("inkStyle")
+if ink_style is not None:
+    if not isinstance(ink_style, dict):
+        raise ValueError("Invalid ink settings")
+    for key in ("paper", "ink", "accent"):
+        value = ink_style.get(key)
+        if not isinstance(value, str) or len(value) != 7 or not value.startswith("#"):
+            raise ValueError("Invalid ink color: " + key)
+        if any(c not in "0123456789abcdefABCDEF" for c in value[1:]):
+            raise ValueError("Invalid ink color: " + key)
+    if ink_style.get("pattern") not in ("hatch", "halftone", "mixed"):
+        raise ValueError("Invalid ink pattern")
+
+road_texture = SCENE.get("textures", {}).get("road")
+road_pixels = None
+sign_pixels = {}
+for i, sign in enumerate(SCENE["signs"]):
+    if sign.get("png"):
+        raw = base64.b64decode(sign["png"], validate=True)
+        if raw[:8] != bytes((137, 80, 78, 71, 13, 10, 26, 10)) or raw[12:16] != b"IHDR" or len(raw) < 24 or struct.unpack(">II", raw[16:24]) != (1024, 256):
+            raise ValueError("Invalid sign PNG")
+        sign_pixels[i] = raw
+if road_texture:
+    width, height = road_texture["width"], road_texture["height"]
+    if type(width) is not int or type(height) is not int or not 0 < width <= 4096 or not 0 < height <= 4096:
+        raise ValueError("Invalid texture dimensions")
+    road_pixels = base64.b64decode(road_texture["rgba"], validate=True)
+    if len(road_pixels) != width * height * 4:
+        raise ValueError("Invalid texture pixel count")
+
+for data in [SCENE["terrain"], *SCENE["meshes"], *SCENE["turbineRotor"], *(mesh for motion in SCENE.get("animations", []) for mesh in motion["meshes"])]:
+    vertices, indices = data["vertices"], data["indices"]
+    finite_values(vertices, data["name"])
+    if len(vertices) % 3 or len(indices) % 3 or any(type(i) is not int or not 0 <= i < len(vertices) // 3 for i in indices):
+        raise ValueError("Invalid mesh indices: " + data["name"])
+    if "uv" in data:
+        finite_values(data["uv"], data["name"] + " UV")
+        if len(data["uv"]) != len(vertices) // 3 * 2:
+            raise ValueError("Invalid UV count: " + data["name"])
+    if "normals" in data:
+        finite_values(data["normals"], data["name"] + " normals")
+        if len(data["normals"]) != len(vertices):
+            raise ValueError("Invalid normal count: " + data["name"])
+    if "edges" in data:
+        finite_values(data["edges"], data["name"] + " edges")
+        if len(data["edges"]) % 6:
+            raise ValueError("Invalid edge count: " + data["name"])
+    if len(data["color"]) != 7 or not data["color"].startswith("#"):
+        raise ValueError("Invalid mesh color: " + data["name"])
+    int(data["color"][1:], 16)
+    if data.get("texture") and (data["texture"] != "road" or road_pixels is None or "uv" not in data):
+        raise ValueError("Invalid mesh texture: " + data["name"])
+    for key in ("roughness", "metalness", "outlineOpacity"):
+        if key in data:
+            finite_values([data[key]], data["name"] + " " + key)
+            if not 0 <= data[key] <= 1:
+                raise ValueError("Invalid material value: " + key)
+finite_values(SCENE["start"], "start")
+for entry in [*SCENE["signs"], *SCENE["turbines"], *SCENE.get("animations", []), *SCENE.get("lamps", []), *SCENE.get("signals", [])]:
+    if len(entry["position"]) != 3:
+        raise ValueError("Invalid transform position")
+    finite_values(entry["position"], "position")
+    finite_values([entry[key] for key in ("yaw", "width", "height", "scale", "phase", "angularSpeed", "rate", "span", "offset", "axis") if key in entry], "transform")
+
+CREATED = []
+MATERIALS = {}
+ROAD_IMAGE = None
+
+def new_data(storage, name, *args):
+    data = storage.new(name, *args)
+    data["ink_racer_id"] = SCENE["id"]
+    CREATED.append((storage, data, name))
+    return data
+
+def material(name, color, roughness=0.86, metalness=0):
+    name = MATERIAL_PREFIX + name + " | " + str(roughness) + " | " + str(metalness)
+    mat = MATERIALS.get(name)
+    if mat is None:
+        mat = new_data(bpy.data.materials, name)
+        MATERIALS[name] = mat
+    mat.diffuse_color = (*color, 1.0)
+    mat.use_nodes = True
+    bsdf = _node(mat.node_tree, "Principled BSDF", "BSDF_PRINCIPLED")
+    if bsdf:
+        bsdf.inputs["Base Color"].default_value = (*color, 1.0)
+        bsdf.inputs["Roughness"].default_value = roughness
+        bsdf.inputs["Metallic"].default_value = metalness
+    return mat
+
+def hex_color(value):
+    value = value.lstrip("#")
+    channels = [int(value[i:i + 2], 16) / 255 for i in (0, 2, 4)]
+    return tuple(c / 12.92 if c <= .04045 else ((c + .055) / 1.055) ** 2.4 for c in channels)
+
+def timed_driver(owner, prop, expression, axis=None):
+    curve = owner.driver_add(prop) if axis is None else owner.driver_add(prop, axis)
+    driver = curve.driver
+    for name, path in (("fps", "render.fps"), ("fps_base", "render.fps_base")):
+        variable = driver.variables.new()
+        variable.name = name
+        variable.type = "SINGLE_PROP"
+        variable.targets[0].id_type = "SCENE"
+        variable.targets[0].id = bpy.context.scene
+        variable.targets[0].data_path = path
+    driver.expression = expression
+
+TIME = "((frame - 1) * fps_base / fps)"
+
+def link_mesh(data, collection):
+    mesh = new_data(bpy.data.meshes, data["name"])
+    vertices = [tuple(data["vertices"][i:i + 3]) for i in range(0, len(data["vertices"]), 3)]
+    faces = [tuple(data["indices"][i:i + 3]) for i in range(0, len(data["indices"]), 3)]
+    mesh.from_pydata(vertices, [], faces)
+    mesh.validate(clean_customdata=False)
+    # Preserve source winding: primitives split vertices at caps, UV seams and hard edges.
+    # Reorienting those disconnected patches independently can turn valid faces inside out.
+    mesh.update()
+    if data.get("normals"):
+        mesh.polygons.foreach_set("use_smooth", [True] * len(mesh.polygons))
+        mesh.normals_split_custom_set_from_vertices([tuple(data["normals"][i:i + 3]) for i in range(0, len(data["normals"]), 3)])
+    obj = new_data(bpy.data.objects, data["name"], mesh)
+    collection.objects.link(obj)
+    glow = data["name"].startswith("city-glow") and SCENE.get("night", {}).get("enabled", False)
+    night = SCENE.get("night", {})
+    wet = night.get("enabled", False) and night.get("weather", "dry") != "dry" and data["name"].startswith(("road-surface", "road-city-surface"))
+    mat = material("InkRacer " + data["color"] + (" luminous" if glow else " wet road" if wet else "") + (" textured" if data.get("texture") else ""), hex_color(data["color"]), data.get("roughness", .18 if wet else .86), data.get("metalness", 0))
+    if data.get("texture") and not mat.node_tree.nodes.get("InkRacer Road Texture"):
+        global ROAD_IMAGE
+        if ROAD_IMAGE is None:
+            width, height = road_texture["width"], road_texture["height"]
+            ROAD_IMAGE = new_data(bpy.data.images, MATERIAL_PREFIX + "Road Texture", width, height)
+            ROAD_IMAGE.colorspace_settings.name = "sRGB"
+            # Canvas scanlines start at the top; Blender image pixels start at the bottom.
+            pixels = [value / 255 for row in range(height - 1, -1, -1) for value in road_pixels[row * width * 4:(row + 1) * width * 4]]
+            ROAD_IMAGE.pixels.foreach_set(pixels)
+            ROAD_IMAGE.pack()
+        texture = mat.node_tree.nodes.new("ShaderNodeTexImage")
+        texture.name = "InkRacer Road Texture"
+        texture.image = ROAD_IMAGE
+        texture.extension = "REPEAT"
+        multiply = mat.node_tree.nodes.new("ShaderNodeMixRGB")
+        multiply.blend_type = "MULTIPLY"
+        multiply.inputs[0].default_value = 1
+        multiply.inputs[1].default_value = (*hex_color(data["color"]), 1)
+        mat.node_tree.links.new(texture.outputs["Color"], multiply.inputs[2])
+        mat.node_tree.links.new(multiply.outputs[0], _node(mat.node_tree, "Principled BSDF", "BSDF_PRINCIPLED").inputs["Base Color"])
+    if glow:
+        bsdf = _node(mat.node_tree, "Principled BSDF", "BSDF_PRINCIPLED")
+        bsdf.inputs["Emission Color"].default_value = (*hex_color(data["color"]), 1)
+        bsdf.inputs["Emission Strength"].default_value = 1.7
+    if data.get("signal"):
+        mat = material(data["name"], hex_color("#141b23"))
+        bsdf = _node(mat.node_tree, "Principled BSDF", "BSDF_PRINCIPLED")
+        bsdf.inputs["Emission Color"].default_value = (*hex_color(data["color"]), 1)
+        signal = data["signal"]
+        phase = "(" + TIME + "+" + str(signal["offset"] + signal["axis"] * 28) + ")%56"
+        condition = phase + ">=27" if signal["bulb"] == 0 else "(" + phase + ">=23)*(" + phase + "<27)" if signal["bulb"] == 1 else phase + "<23"
+        timed_driver(bsdf.inputs["Emission Strength"], "default_value", "4 if " + condition + " else 0")
+    obj.data.materials.append(mat)
+    if data.get("uv"):
+        uv_layer = mesh.uv_layers.new(name="UVMap")
+        uv = data["uv"]
+        for polygon in mesh.polygons:
+            for loop_index in polygon.loop_indices:
+                vertex_index = mesh.loops[loop_index].vertex_index
+                uv_layer.data[loop_index].uv = (uv[vertex_index * 2], uv[vertex_index * 2 + 1])
+    if data.get("edges") and ink_style is not None:
+        curve = new_data(bpy.data.curves, "Ink outline | " + data["name"], "CURVE")
+        curve.dimensions = "3D"
+        # ponytail: meter-width strokes, not the game's constant pixel width; screen-space ink needs a compositor pass.
+        curve.bevel_depth = .008
+        curve.bevel_resolution = 0
+        curve.resolution_u = 1
+        for i in range(0, len(data["edges"]), 6):
+            edge = data["edges"][i:i + 6]
+            if sum((edge[j] - edge[j + 3]) ** 2 for j in range(3)) < 1e-12:
+                continue
+            spline = curve.splines.new("POLY")
+            spline.points.add(1)
+            spline.points[0].co = (*edge[:3], 1)
+            spline.points[1].co = (*edge[3:], 1)
+        outline = new_data(bpy.data.objects, "Ink outline | " + data["name"], curve)
+        collection.objects.link(outline)
+        outline.parent = obj
+        outline.visible_shadow = False
+        outline.visible_diffuse = False
+        opacity = data.get("outlineOpacity", 1)
+        ink_mat = material("Ink outline " + str(opacity), hex_color(ink_style["ink"]))
+        if not ink_mat.node_tree.nodes.get("Ink Outline Emission"):
+            ink_mat.node_tree.nodes.clear()
+            emission = ink_mat.node_tree.nodes.new("ShaderNodeEmission")
+            emission.name = "Ink Outline Emission"
+            emission.inputs["Color"].default_value = (*hex_color(ink_style["ink"]), 1)
+            output = ink_mat.node_tree.nodes.new("ShaderNodeOutputMaterial")
+            if opacity < 1:
+                transparent = ink_mat.node_tree.nodes.new("ShaderNodeBsdfTransparent")
+                mix = ink_mat.node_tree.nodes.new("ShaderNodeMixShader")
+                mix.inputs[0].default_value = opacity
+                ink_mat.node_tree.links.new(transparent.outputs[0], mix.inputs[1])
+                ink_mat.node_tree.links.new(emission.outputs[0], mix.inputs[2])
+                ink_mat.node_tree.links.new(mix.outputs[0], output.inputs["Surface"])
+                ink_mat.blend_method = "BLEND"
+            else:
+                ink_mat.node_tree.links.new(emission.outputs[0], output.inputs["Surface"])
+        curve.materials.append(ink_mat)
+    return obj
+
+def text_object(body, location, rotation, size, collection, material_data):
+    curve = new_data(bpy.data.curves, body or "InkRacer Text", "FONT")
+    curve.body = body
+    curve.align_x = "CENTER"
+    curve.align_y = "CENTER"
+    curve.size = size
+    curve.extrude = 0.005
+    obj = new_data(bpy.data.objects, body or "InkRacer Text", curve)
+    obj.location = location
+    obj.rotation_euler[1] = rotation
+    curve.materials.append(material_data)
+    collection.objects.link(obj)
+    return obj
+
+def remove_course_collection(collection, managed_objects=None):
+    if managed_objects is None:
+        managed_objects = set(collection.all_objects)
+    # Detach retained children before any parent is deleted, independent of collection order.
+    for obj in list(collection.objects):
+        if len(obj.users_collection) > 1 and obj.parent in managed_objects:
+            world_matrix = obj.matrix_world.copy()
+            obj.parent = None
+            obj.matrix_world = world_matrix
+    for child in list(collection.children):
+        if child.users > 1:
+            retained_objects = set(child.all_objects)
+            for obj in retained_objects:
+                if obj.parent in managed_objects and obj.parent not in retained_objects:
+                    world_matrix = obj.matrix_world.copy()
+                    obj.parent = None
+                    obj.matrix_world = world_matrix
+            collection.children.unlink(child)
+            continue
+        remove_course_collection(child, managed_objects)
+    for obj in list(collection.objects):
+        if len(obj.users_collection) > 1:
+            collection.objects.unlink(obj)
+            continue
+        data = obj.data
+        kind = obj.type
+        bpy.data.objects.remove(obj, do_unlink=True)
+        if data is not None and data.users == 0:
+            if kind == "MESH":
+                bpy.data.meshes.remove(data)
+            elif kind in ("FONT", "CURVE", "SURFACE"):
+                bpy.data.curves.remove(data)
+            elif kind == "LIGHT":
+                bpy.data.lights.remove(data)
+    bpy.data.collections.remove(collection)
+
+old = next((collection for collection in bpy.context.scene.collection.children if collection.get("ink_racer_id") == SCENE["id"]), None)
+previous_world = bpy.context.scene.world
+previous_exposure = bpy.context.scene.view_settings.exposure
+previous_frame_end = bpy.context.scene.frame_end
+try:
+    COURSE = new_data(bpy.data.collections, COLLECTION_NAME)
+    COURSE["ink_racer_id"] = SCENE["id"]
+    COURSE["ink_racer_name"] = SCENE["name"]
+    if ink_style is not None:
+        COURSE["ink_racer_art"] = json.dumps(ink_style, ensure_ascii=False)
+    bpy.context.scene.collection.children.link(COURSE)
+    
+    def course_group(label):
+        collection = new_data(bpy.data.collections, COLLECTION_NAME + " / " + label)
+        COURSE.children.link(collection)
+        return collection
+    
+    TERRAIN = course_group("地形")
+    TRACK = course_group("トラック")
+    OBJECTS = course_group("オブジェクト")
+    
+    link_mesh(SCENE["terrain"], TERRAIN)
+    for data in SCENE["meshes"]:
+        if data["name"] in ("district-foundation", "district-water") or data["name"].startswith("water-"):
+            collection = TERRAIN
+        elif data["name"].startswith(("road-", "pit-")):
+            collection = TRACK
+        else:
+            collection = OBJECTS
+        link_mesh(data, collection)
+    
+    paper = material("InkRacer Paper", hex_color("#f1e6cc"))
+    ink = material("InkRacer Ink", hex_color("#263c50"))
+    led = material("InkRacer LED", hex_color("#e3ae55"))
+    led_bsdf = _node(led.node_tree, "Principled BSDF", "BSDF_PRINCIPLED")
+    if led_bsdf:
+        led_bsdf.inputs["Emission Color"].default_value = (*hex_color("#e3ae55"), 1.0)
+        led_bsdf.inputs["Emission Strength"].default_value = 1.5
+    for i, sign in enumerate(SCENE["signs"]):
+        width = sign["width"]
+        height = sign.get("height", width / 4)
+        x, y, z = sign["position"]
+        mesh = new_data(bpy.data.meshes, "Sign | " + sign["title"])
+        mesh.from_pydata([(-width / 2, -height / 2, 0), (width / 2, -height / 2, 0), (width / 2, height / 2, 0), (-width / 2, height / 2, 0)], [], [(0, 1, 2, 3)])
+        sign_obj = new_data(bpy.data.objects, "Sign | " + sign["title"], mesh)
+        sign_obj.location = (x, y, z)
+        sign_obj.rotation_euler[1] = sign["yaw"]
+        OBJECTS.objects.link(sign_obj)
+        if i in sign_pixels:
+            image_name = MATERIAL_PREFIX + "Sign %03d" % i
+            with tempfile.TemporaryDirectory(prefix="ink-racer-sign-") as folder:
+                image_path = os.path.join(folder, "sign.png")
+                with open(image_path, "wb") as file:
+                    file.write(sign_pixels[i])
+                image = bpy.data.images.load(image_path, check_existing=False)
+                image["ink_racer_id"] = SCENE["id"]
+                CREATED.append((bpy.data.images, image, image_name))
+                image.name = image_name
+                if tuple(image.size) != (1024, 256):
+                    raise ValueError("Cannot decode sign PNG")
+                image.colorspace_settings.name = "sRGB"
+                image.pack()
+                image.filepath = "//InkRacer-Sign-%03d.png" % i
+            uv = mesh.uv_layers.new(name="UVMap")
+            for loop, coordinate in zip(uv.data, ((0, 0), (1, 0), (1, 1), (0, 1))):
+                loop.uv = coordinate
+            mat = material("Sign Texture %03d" % i, (1, 1, 1))
+            mat.node_tree.nodes.clear()
+            texture = mat.node_tree.nodes.new("ShaderNodeTexImage")
+            texture.name = "InkRacer Sign Texture"
+            texture.image = image
+            texture.extension = "EXTEND"
+            emission = mat.node_tree.nodes.new("ShaderNodeEmission")
+            output = mat.node_tree.nodes.new("ShaderNodeOutputMaterial")
+            mat.node_tree.links.new(texture.outputs["Color"], emission.inputs["Color"])
+            mat.node_tree.links.new(emission.outputs[0], output.inputs["Surface"])
+            sign_obj.data.materials.append(mat)
+            # Game bitmap signs are unlit artwork, not area lights or shadow casters.
+            sign_obj.visible_shadow = False
+            sign_obj.visible_diffuse = False
+            continue
+        electronic = sign.get("electronic", False)
+        sign_obj.data.materials.append(ink if electronic else paper)
+        # Offset text along the rotated sign normal, not world Z.
+        title = text_object(sign["title"], (x + math.sin(sign["yaw"]) * .012, y + height * .05, z + math.cos(sign["yaw"]) * .012), sign["yaw"], height * (.22 if electronic else .38), OBJECTS, led if electronic else ink)
+        title.data.size *= min(1.0, width * .92 / max(.001, len(sign["title"]) * title.data.size * .65))
+        text_object(sign["subtitle"], (x + math.sin(sign["yaw"]) * .018, y - height * .28, z + math.cos(sign["yaw"]) * .018), sign["yaw"], max(.08, height * .1), OBJECTS, led if electronic else ink)
+    
+    for turbine in SCENE["turbines"]:
+        mount = new_data(bpy.data.objects, "Wind Turbine Mount", None)
+        mount.location = tuple(turbine["position"])
+        mount.rotation_euler[1] = turbine["yaw"]
+        mount.scale = (turbine["scale"],) * 3
+        OBJECTS.objects.link(mount)
+        rotor = new_data(bpy.data.objects, "Wind Turbine Rotor", None)
+        rotor.parent = mount
+        OBJECTS.objects.link(rotor)
+        for part in SCENE["turbineRotor"]:
+            obj = link_mesh(part, OBJECTS)
+            obj.parent = rotor
+        rotor.rotation_euler[2] = turbine["phase"]
+        timed_driver(rotor, "rotation_euler", str(turbine["phase"]) + " + " + TIME + " * " + str(turbine["angularSpeed"]), 2)
+        bpy.context.scene.frame_end = max(bpy.context.scene.frame_end, 241)
+    
+    # The same local motion equations as venueMotionAt; frame 1 is game time zero.
+    for motion in SCENE.get("animations", []):
+        mount = new_data(bpy.data.objects, motion["name"] + " Mount", None)
+        mount.location = tuple(motion["position"])
+        mount.rotation_euler[1] = motion["yaw"]
+        OBJECTS.objects.link(mount)
+        moving = new_data(bpy.data.objects, motion["name"], None)
+        moving.parent = mount
+        OBJECTS.objects.link(moving)
+        for part in motion["meshes"]:
+            obj = link_mesh(part, OBJECTS)
+            obj.parent = moving
+        t = "(" + TIME + " * " + str(motion["rate"]) + " + " + str(motion["phase"]) + ")"
+        span = str(motion["span"])
+        kind = motion["kind"]
+        channels = []
+        if kind in ("train", "gondola"):
+            channels.append(("location", 2, "sin(" + t + ") * " + span))
+        if kind == "gondola":
+            channels.append(("location", 1, "-4 * (1 - sin(" + t + ") ** 2)"))
+        if kind == "dish":
+            channels.append(("rotation_euler", 1, t))
+        if kind == "flag":
+            channels.append(("rotation_euler", 2, "sin(" + t + ") * .25"))
+        if kind == "airship":
+            channels += [("location", 0, "cos(" + t + ") * " + span), ("location", 2, "sin(" + t + ") * " + span + " * .6"), ("rotation_euler", 1, "atan2(-sin(" + t + "), .6 * cos(" + t + "))")]
+        if kind == "helicopter":
+            channels += [("location", 0, "sin(" + t + ") * " + span), ("location", 2, "sin(" + t + " * .5) * " + span + " * .12"), ("rotation_euler", 1, "pi / 2 if cos(" + t + ") >= 0 else -pi / 2")]
+        if kind == "water":
+            channels.append(("location", 1, "-(" + t + " - floor(" + t + ")) * " + span))
+        for prop, axis, expression in channels:
+            timed_driver(moving, prop, expression, axis)
+        bpy.context.scene.frame_end = max(bpy.context.scene.frame_end, 241)
+    
+    start = new_data(bpy.data.objects, "START / FINISH", None)
+    start.empty_display_type = "CIRCLE"
+    start.empty_display_size = 3.0
+    start.location = tuple(SCENE["start"])
+    TRACK.objects.link(start)
+    
+    world = new_data(bpy.data.worlds, MATERIAL_PREFIX + "World")
+    bpy.context.scene.world = world
+    world.use_nodes = True
+    night = SCENE.get("night", {})
+    _node(world.node_tree, "Background", "BACKGROUND").inputs["Color"].default_value = (*hex_color("#101e38" if night.get("enabled") else "#c8d6d7"), 1.0)
+    _node(world.node_tree, "Background", "BACKGROUND").inputs["Strength"].default_value = .23 if night.get("enabled") else .8
+    sun_data = new_data(bpy.data.lights, "InkRacer Sun", "SUN")
+    sun_data.energy = .17 if night.get("enabled") else 2.1
+    sun_data.color = hex_color("#92b7f0" if night.get("enabled") else "#fff0d0")
+    sun_data.use_shadow = not night.get("enabled", False)
+    sun = new_data(bpy.data.objects, "InkRacer Sun", sun_data)
+    sun.rotation_euler = Vector((20, 80, -40) if night.get("enabled") else (-45, 85, -30)).to_track_quat("Z", "Y").to_euler()
+    OBJECTS.objects.link(sun)
+    
+    bpy.context.scene.view_settings.exposure = math.log2(night.get("brightness", 1)) if night.get("enabled") else 0
+    if night.get("enabled"):
+        warm = night.get("warmth", .65)
+        cool, amber = hex_color("#a9d4ff"), hex_color("#ffb866")
+        for i, lamp in enumerate(SCENE.get("lamps", [])):
+            light = new_data(bpy.data.lights, "Streetlight %03d" % i, "POINT")
+            light.energy = 150
+            light.color = tuple(a * (1 - warm) + b * warm for a, b in zip(cool, amber))
+            light.shadow_soft_size = .4
+            obj = new_data(bpy.data.objects, "Streetlight %03d" % i, light)
+            x, y, z = lamp["position"]
+            obj.location = (x, y - .8, z)
+            OBJECTS.objects.link(obj)
+        for i, signal in enumerate(SCENE.get("signals", [])):
+            x, y, z = signal["position"]
+            yaw = signal["yaw"]
+            for side in (-1, 1):
+                for bulb, color in enumerate(("#ed294a", "#ffb429", "#55e7b2")):
+                    local_x, local_z = -side * 2.7 + (bulb - 1) * .5, -side * 13
+                    light = new_data(bpy.data.lights, "Signal %03d %s %s" % (i, side, bulb), "POINT")
+                    light.color = hex_color(color)
+                    light.shadow_soft_size = .15
+                    obj = new_data(bpy.data.objects, "Signal %03d %s %s" % (i, side, bulb), light)
+                    obj.location = (x + math.cos(yaw) * local_x + math.sin(yaw) * local_z, y + 6.55, z - math.sin(yaw) * local_x + math.cos(yaw) * local_z)
+                    OBJECTS.objects.link(obj)
+                    phase = "(" + TIME + "+" + str(signal["offset"] + signal["axis"] * 28) + ")%56"
+                    condition = phase + ">=27" if bulb == 0 else "(" + phase + ">=23)*(" + phase + "<27)" if bulb == 1 else phase + "<23"
+                    timed_driver(light, "energy", "8 if " + condition + " else 0")
+    
+    # Three.js uses Y-up with an XZ ground plane; Blender uses Z-up with an XY ground plane.
+    # One parent keeps every mesh, text object, light, and animation on the same basis.
+    COORDINATE_ROOT = new_data(bpy.data.objects, "InkRacer Coordinate Root", None)
+    COORDINATE_ROOT.empty_display_type = "PLAIN_AXES"
+    COORDINATE_ROOT.rotation_euler[0] = math.pi / 2
+    # Source coordinates are meters; preserve the user's existing scene unit scale.
+    unit_scale = 1 / bpy.context.scene.unit_settings.scale_length
+    COORDINATE_ROOT.scale = (unit_scale,) * 3
+    COURSE.objects.link(COORDINATE_ROOT)
+    for collection in (TERRAIN, TRACK, OBJECTS):
+        for obj in list(collection.objects):
+            if obj.parent is None:
+                basis = obj.matrix_basis.copy()
+                obj.parent = COORDINATE_ROOT
+                obj.matrix_parent_inverse = Matrix.Identity(4)
+                obj.matrix_basis = basis
+            if obj.type == "LIGHT" and obj.data.type == "POINT":
+                light = obj.data
+                light.shadow_soft_size *= unit_scale
+                energy_driver = next((curve.driver for curve in light.animation_data.drivers if curve.data_path == "energy"), None) if light.animation_data else None
+                if energy_driver:
+                    energy_driver.expression = "(" + energy_driver.expression + ") * " + str(unit_scale ** 2)
+                else:
+                    light.energy *= unit_scale ** 2
+    bpy.context.view_layer.update()
+    
+    if ink_style is not None:
+        COURSE["ink_racer_halftone"] = create_ink_halftone(bpy.context.scene, new_data, MATERIAL_PREFIX)
+        COURSE["ink_racer_paper"] = create_ink_paper(new_data, MATERIAL_PREFIX, ink_style, SCENE["night"], COURSE["ink_racer_halftone"])
+        COURSE["ink_racer_hatch"] = create_ink_hatch(bpy.context.scene, new_data, MATERIAL_PREFIX, COURSE["ink_racer_halftone"])
+        COURSE["ink_racer_geometry"] = create_ink_geometry(new_data, MATERIAL_PREFIX, SCENE["night"], COURSE["ink_racer_hatch"], COURSE["ink_racer_paper"])
+        COURSE["ink_racer_page"] = create_ink_page(bpy.context.scene, new_data, MATERIAL_PREFIX, ink_style, COURSE["ink_racer_halftone"])
+        COURSE["ink_racer_preview_scene"] = create_ink_preview(bpy.context.scene, COURSE, COORDINATE_ROOT, SCENE, new_data, MATERIAL_PREFIX)
+    
+    
+except Exception:
+    bpy.context.scene.world = previous_world
+    bpy.context.scene.view_settings.exposure = previous_exposure
+    bpy.context.scene.frame_end = previous_frame_end
+    for storage, data, name in reversed(CREATED):
+        if storage == bpy.data.objects:
+            storage.remove(data, do_unlink=True)
+    for storage, data, name in reversed(CREATED):
+        if storage == bpy.data.collections:
+            storage.remove(data)
+    for storage, data, name in reversed(CREATED):
+        if storage == bpy.data.scenes:
+            storage.remove(data)
+    for storage, data, name in reversed(CREATED):
+        if storage not in (bpy.data.objects, bpy.data.collections, bpy.data.materials, bpy.data.images, bpy.data.scenes) and data.users == 0:
+            storage.remove(data)
+    for storage, data, name in reversed(CREATED):
+        if storage == bpy.data.materials and data.users == 0:
+            storage.remove(data)
+    for storage, data, name in reversed(CREATED):
+        if storage == bpy.data.images and data.users == 0:
+            storage.remove(data)
+    raise
+else:
+    if old:
+        remove_ink_preview(old)
+        if old.users > 1:
+            bpy.context.scene.collection.children.unlink(old)
+        else:
+            remove_course_collection(old)
+    retained = [(storage, data, name) for storage, data, name in CREATED if data.users > 0]
+    for storage in (bpy.data.materials, bpy.data.worlds, bpy.data.images):
+        for data in list(storage):
+            if data.get("ink_racer_id") == SCENE["id"] and data.users == 0:
+                storage.remove(data)
+    # Nested compositor groups must be freed from the outside inward.
+    while True:
+        unused = [data for data in bpy.data.node_groups if data.get("ink_racer_id") == SCENE["id"] and data.users == 0]
+        if not unused:
+            break
+        for data in unused:
+            bpy.data.node_groups.remove(data)
+    for data in list(bpy.data.textures):
+        if data.get("ink_racer_id") == SCENE["id"] and data.users == 0:
+            bpy.data.textures.remove(data)
+    for storage, data, name in retained:
+        data.name = name
+    bpy.context.view_layer.update()
+    print("Created", COLLECTION_NAME, "with", len(SCENE["meshes"]), "environment meshes")
+    if COURSE.get("ink_racer_preview_scene"):
+        print("Ink render: choose scene", COURSE["ink_racer_preview_scene"].name)
