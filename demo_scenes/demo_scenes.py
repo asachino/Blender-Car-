@@ -11,9 +11,15 @@ ns = {"__name__": "__main__"}
 exec(compile(open(ADDON, encoding="utf-8").read(), ADDON, "exec"), ns)
 import r32_scene as RS
 import cars3 as C3
+import cars5 as C5
 
-C3.link_into("R32")                  # テスタロッサと S2000 も R32 のシーンへ（他のシーンを消す前に）
-sc = RS.scene()
+# 5車種のファイル（シーン「CPB_READY_5車種」）なら新しい車、そうでなければ R32 のファイル
+MODE5 = C5.SCENE in bpy.data.scenes
+if MODE5:
+    sc = C5.scene()
+else:
+    C3.link_into("R32")              # テスタロッサと S2000 も R32 のシーンへ（他のシーンを消す前に）
+    sc = RS.scene()
 sc.render.fps = 24
 sc.render.fps_base = 1.0
 sc.render.resolution_x, sc.render.resolution_y = 1280, 720
@@ -22,14 +28,28 @@ if hasattr(sc.eevee, "taa_render_samples"):
     sc.eevee.taa_render_samples = 12
 if hasattr(sc.eevee, "use_gtao"):
     sc.eevee.use_gtao = True
-CARS = C3.setup(sc)                  # {"R32": (ボディ, ホイール4本), "TESTA": ..., "S2000": ...}
-body, wheels = CARS["R32"]
-CUR = "R32"
-for k_ in ("TESTA", "S2000"):
-    C3.park(CARS[k_][0])
-s = RS.assign(sc)
-bpy.ops.cpb.detect_scale()
-K = s.model_scale
+if MODE5:
+    CARS = C5.setup(sc)              # {"R32": (BODY, ホイール4本), "S2000", "F40", "COUNTACH", "TESTA"}
+    body, wheels = CARS["R32"]
+    CUR = "R32"
+    for i_, k_ in enumerate(k_ for k_ in CARS if k_ != "R32"):
+        C5.park(CARS[k_], i_)
+    C5.place(CARS["R32"], (0, 0, 0))
+    s = sc.cpb
+    s.body = body
+    s.wheel_fl, s.wheel_fr, s.wheel_rl, s.wheel_rr = wheels
+    s.forward_axis = "POS_Y"
+    s.model_scale = 1.0
+    K = 1.0
+else:
+    CARS = C3.setup(sc)              # {"R32": (ボディ, ホイール4本), "TESTA": ..., "S2000": ...}
+    body, wheels = CARS["R32"]
+    CUR = "R32"
+    for k_ in ("TESTA", "S2000"):
+        C3.park(CARS[k_][0])
+    s = RS.assign(sc)
+    bpy.ops.cpb.detect_scale()
+    K = s.model_scale
 
 
 # ======================================================================
@@ -244,12 +264,23 @@ def cone_mesh():
 
 
 TINTED = {}
-CAR_NAME = {"R32": "R32", "TESTA": "テスタロッサ", "S2000": "S2000"}
+CAR_NAME = dict(C5.NAME) if MODE5 else {"R32": "R32", "TESTA": "テスタロッサ", "S2000": "S2000"}
 
 
 def pick(key):
     """主役の車を選ぶ（R32 / TESTA / S2000）。使わない車は遠くへ置いて、レンダーにも出さない"""
     global body, wheels, CUR
+    if MODE5:
+        for i_, (k_, car_) in enumerate(CARS.items()):
+            if k_ == key:
+                C5.place(car_, (0, 0, 0))
+                for o in C5.tree(car_):
+                    o.hide_render = False
+            else:
+                C5.park(car_, i_)
+        body, wheels = CARS[key]
+        CUR = key
+        return
     for k_, (b_, w_) in CARS.items():
         if k_ == key:
             b_.location = (0, 0, 0)
@@ -265,7 +296,9 @@ def dup_car(offset, tint=None, model=None):
     """車をまるごと複製（model=None なら今の主役。tint を与えるとボディの色を変える）"""
     sb, sw = CARS[model] if model else (body, wheels)
     mp = {}
-    for o in [sb] + list(sb.children_recursive):
+    srcs = [sb] + list(sb.children_recursive)
+    srcs += [w for w in sw if w not in srcs]          # 5車種のファイルではホイールはボディの子ではない
+    for o in srcs:
         c = o.copy()
         c.hide_render = False
         if tint is not None and o.type == 'MESH' and "shadow" not in o.name:
@@ -305,6 +338,9 @@ def dup_car(offset, tint=None, model=None):
         if o.parent in mp:
             c.parent = mp[o.parent]
     b2 = mp[sb]
+    if MODE5:
+        C5.place((b2, [mp[w] for w in sw]), Vector(offset) * K)
+        return b2, [mp[w] for w in sw]
     b2.location = Vector(offset) * K
     return b2, [mp[w] for w in sw]
 
@@ -407,12 +443,16 @@ def report_frame(prefix):
 
 
 def car_setup(path, g, preset="SPORTS", **kw):
-    RS.assign(sc, path, g)
+    if MODE5:
+        s.path, s.ground = path, g
+        s.forward_axis = "POS_Y"
+    else:
+        RS.assign(sc, path, g)
     s.body = body
     s.wheel_fl, s.wheel_fr, s.wheel_rl, s.wheel_rr = wheels
     s.model_scale = K
     s.preset = preset
-    for a_, v_ in C3.PHYS[CUR].items():
+    for a_, v_ in (C5.PHYS if MODE5 else C3.PHYS)[CUR].items():
         setattr(s, a_, v_)
     s.show_trajectory = False
     s.stop_at_end = False
@@ -1335,13 +1375,22 @@ def scene_oval():
     s.use_multi = True
     s.multi_collide = False
     #        名前    色                       ライン  後ろへ(m) 速さ倍率
-    grid = [("テスタロッサ", None, "TESTA", -0.4, 4.5, 1.0),
-            ("S2000", None, "S2000", 2.7, 10.5, 1.012),
-            ("R32_黄", (0.95, 0.72, 0.03, 1), "R32", -3.7, 13.0, 1.0),
-            ("テスタロッサ_黒", (0.03, 0.03, 0.035, 1), "TESTA", -0.8, 19.5, 1.008),
-            ("S2000_橙", (1.0, 0.35, 0.02, 1), "S2000", -3.2, 26.0, 0.995),
-            ("R32_緑", (0.05, 0.55, 0.15, 1), "R32", 2.4, 28.5, 1.0),
-            ("テスタロッサ_黄", (0.95, 0.72, 0.03, 1), "TESTA", -0.5, 35.0, 0.99)]
+    if MODE5:
+        grid = [("F40", None, "F40", -0.4, 4.5, 1.0),
+                ("カウンタック", None, "COUNTACH", 2.7, 10.5, 1.012),
+                ("テスタロッサ", None, "TESTA", -3.7, 13.0, 1.0),
+                ("S2000", None, "S2000", -0.8, 19.5, 1.008),
+                ("F40_黄", (0.95, 0.72, 0.03, 1), "F40", -3.2, 26.0, 0.995),
+                ("カウンタック_緑", (0.05, 0.55, 0.15, 1), "COUNTACH", 2.4, 28.5, 1.0),
+                ("R32_青", (0.1, 0.25, 0.85, 1), "R32", -0.5, 35.0, 0.99)]
+    else:
+        grid = [("テスタロッサ", None, "TESTA", -0.4, 4.5, 1.0),
+                ("S2000", None, "S2000", 2.7, 10.5, 1.012),
+                ("R32_黄", (0.95, 0.72, 0.03, 1), "R32", -3.7, 13.0, 1.0),
+                ("テスタロッサ_黒", (0.03, 0.03, 0.035, 1), "TESTA", -0.8, 19.5, 1.008),
+                ("S2000_橙", (1.0, 0.35, 0.02, 1), "S2000", -3.2, 26.0, 0.995),
+                ("R32_緑", (0.05, 0.55, 0.15, 1), "R32", 2.4, 28.5, 1.0),
+                ("テスタロッサ_黄", (0.95, 0.72, 0.03, 1), "TESTA", -0.5, 35.0, 0.99)]
     cars = [(body, None)]
     for nm, tint, model, lane, back, sm in grid:
         b2, w2 = dup_car((R, Y0 - back, 0), tint, model=model)
@@ -1362,7 +1411,7 @@ def scene_oval():
     c = chase_cam("カメラC_車載", cars[7][0], 1, 330, dist=5.5, height=1.45, side=0.0, lens=22, look=25)
     d = fixed_cam("カメラD_空撮", (-40, 60, 110), mid_car, 1, 330, lens=110, smooth=0.15)
     e = fixed_cam("カメラE_リプレイ", (8, L / 2 + R - 13.5, 0.5), body, 1, 330, lens=24, smooth=0.5)
-    finish("オーバルを8台のパックで", "R32・テスタロッサ・S2000 ×8 ／ ナスカー風。バンクの付いたターンを団子で駆け抜ける",
+    finish("オーバルを8台のパックで", ("R32・S2000・F40・カウンタック・テスタロッサ ×8" if MODE5 else "R32・テスタロッサ・S2000 ×8") + " ／ ナスカー風。バンクの付いたターンを団子で駆け抜ける",
            [(a, 1, 75), (b, 76, 160), (c, 161, 245), (d, 246, 330)], (e, apex - 30, apex + 22, 0.5))
 
 
