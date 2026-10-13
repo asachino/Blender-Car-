@@ -3027,7 +3027,8 @@ def scene_drift_jump():
     p2 = course(join(line((0, -STR - 4), (0, -STR)), pts[1:]), "走行ライン2", fn=gfn)
     b2, w2 = dup_car((0, -STR - 4, 0), None, model="TESTA")
     # 外側の車線（半径が大きい）を走るので少し速く、車間は取らずに並んだまま
-    add_car(b2, w2, p2, lane_offset=-1.9, speed_mult=1.03, start_speed=127, overtake=False, avoid=False)
+    # 5車種のモデル（実寸）では外へ寄せすぎるとクレストの縁で大きく傾くので、少し内側を走らせる
+    add_car(b2, w2, p2, lane_offset=-1.4 if MODE5 else -1.9, speed_mult=1.03, start_speed=127, overtake=False, avoid=False)
     bake()
     lip_xy = (CX + RR * math.cos(math.radians(LIP_DEG)), CY + RR * math.sin(math.radians(LIP_DEG)))
     takeoff = frame_near(body, lip_xy, 1, F)

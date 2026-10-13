@@ -28,7 +28,7 @@ blender -b <車のモデル.blend> --python demo_scenes/demo_scenes.py -- car_ph
 ```
 
 車のモデル（R32・テスタロッサ・S2000）を入れた .blend が別に必要です（このリポジトリには含めていません）。
-5車種（R32・S2000・F40・カウンタック・テスタロッサ）のタグ付きファイル（シーン「CPB_READY_5車種」）を渡すと、[cars5.py](demo_scenes/cars5.py) で車を拾います（今は 14_oval が5車種に対応）。
+5車種（R32・S2000・F40・カウンタック・テスタロッサ）のタグ付きファイル（シーン「CPB_READY_5車種」）を渡すと、[cars5.py](demo_scenes/cars5.py) で車を拾います（01_chicane_roll・02_spin_barrier・13_jump_roll・14_oval・27_drift_jump で確認済み）。
 
 ## タグ付き車両コレクションのセットアップ
 
