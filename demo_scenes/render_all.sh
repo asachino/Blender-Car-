@@ -12,6 +12,6 @@ for n in "$@"; do
     "$B" -b "$d/$n.blend" --python tools/render_demo.py -- "$d/frames" $j $NJ > scenes/$n/render_$j.log 2>&1 &
   done
   wait
-  PYTHONUTF8=1 python tools/assemble_demo.py "$d/frames" "$FF" "$d/$n.mp4" "$d/meta.json" > scenes/$n/assemble.log 2>&1
+  CPB_FPS=${CPB_FPS:-24} PYTHONUTF8=1 python tools/assemble_demo.py "$d/frames" "$FF" "$d/$n.mp4" "$d/meta.json" > scenes/$n/assemble.log 2>&1
   echo "DONE $n $(ls scenes/$n/frames | wc -l) frames $(( $(date +%s)-t0 ))s $(ls -la scenes/$n/$n.mp4 2>/dev/null | awk '{print $5}')"
 done

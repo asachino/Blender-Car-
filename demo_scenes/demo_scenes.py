@@ -2,7 +2,7 @@
 blender -b <R32のコピー.blend> --python demo_scenes.py -- <addon.py> <シーン名> <保存先.blend>
 """
 import bpy, bmesh, sys, os, math, json
-from mathutils import Vector
+from mathutils import Vector, Matrix
 
 args = sys.argv[sys.argv.index("--") + 1:]
 ADDON, SCENE, SAVE = args[0], args[1], args[2]
@@ -3043,8 +3043,774 @@ def scene_drift_jump():
            (c, takeoff - 10, takeoff + 30, 0.4))
 
 
+def scene_spin_dodge():
+    """峠の下りの高速コーナー: 前の車がスピン、後ろの S2000 がドリフトのまま間一髪ですり抜ける"""
+    global TERRAIN
+    import numpy as np
+    import random as _r
+    pick("S2000")
+    F = 230
+    sc.frame_start, sc.frame_end = 1, F
+    GRADE = 0.085                                   # 8.5% の下り
+    ROAD = 4.5                                      # 片側の幅（2車線で 9 m）
+    # 道: ゆるい左（R150）→ 右の高速コーナー（R45・110°）→ ゆるい右（R150）。
+    # 直線を作らない（ドリフトはコースの曲がりに合わせて付くので、ずっと曲げておけば途切れない）。
+    # 左から右へ切り返す所で、車は振り返し（フェイント）てコーナーへ入る
+    a_end = 70.0
+    ex, ey = 45 + 45 * math.cos(math.radians(a_end)), 45 * math.sin(math.radians(a_end))
+    tx_, ty_ = math.sin(math.radians(a_end)), -math.cos(math.radians(a_end))
+    RE = 150.0
+    ecx, ecy = ex + ty_ * RE, ey - tx_ * RE        # 出口のゆるい右の中心（進む向きの右）
+    e0 = math.degrees(math.atan2(ey - ecy, ex - ecx))
+    pts = join(arc(-RE, 0, RE, -42, 0, 1.0), arc(45, 0, 45, 180, a_end, 1.0), arc(ecx, ecy, RE, e0, e0 - 50, 1.0))
+    PX = np.array([p_[0] for p_ in pts])
+    PY = np.array([p_[1] for p_ in pts])
+    SEG = np.hypot(np.diff(PX), np.diff(PY))
+    S = np.concatenate([[0.0], np.cumsum(SEG)])
+    TX = np.gradient(PX)
+    TY = np.gradient(PY)
+    TL = np.hypot(TX, TY)
+    TX, TY = TX / TL, TY / TL
+
+    def near(x, y):
+        d2 = (PX - x) ** 2 + (PY - y) ** 2
+        i = int(np.argmin(d2))
+        best = None
+        for j in (i - 1, i):                    # 前後の線分に投影して、道のりを連続にする
+            if j < 0 or j + 1 >= len(PX):
+                continue
+            ax, ay, bx, by = PX[j], PY[j], PX[j + 1], PY[j + 1]
+            vx, vy = bx - ax, by - ay
+            L2 = vx * vx + vy * vy
+            u = max(0.0, min(1.0, ((x - ax) * vx + (y - ay) * vy) / L2))
+            qx, qy = ax + vx * u, ay + vy * u
+            dd = (x - qx) ** 2 + (y - qy) ** 2
+            if best is None or dd < best[0]:
+                L_ = math.sqrt(L2)
+                best = (dd, S[j] + u * L_, (vx / L_) * (y - qy) - (vy / L_) * (x - qx))
+        if best is None:
+            return float(S[i]), float(TX[i] * (y - PY[i]) - TY[i] * (x - PX[i]))
+        return float(best[1]), float(best[2])
+
+    def road_z(s_):
+        return -GRADE * s_ + 1.2 * math.sin(s_ * 0.03)
+
+    def gfn(x, y):
+        s_, d = near(x, y)
+        z = road_z(s_)
+        if d > ROAD + 1.5:                       # 左（コーナーの外）は谷へ落ちる
+            z -= min(34.0, (d - ROAD - 1.5) * 0.55 + 0.05 * (d - ROAD - 1.5) ** 1.3)
+        elif d < -(ROAD + 1.5):                   # 右（内側）は山の斜面
+            u = -d - ROAD - 1.5
+            z += min(45.0, u * 0.85) + 1.5 * math.sin(x * 0.11) * math.cos(y * 0.09) * min(1.0, u / 8)
+        return z
+    TERRAIN = gfn
+    g = ground(gfn, 460, (50, 0), subdiv=360, material="芝")
+    ribbon(pts, -ROAD, ROAD, 0.04, gfn)
+    # 白線（両端）とセンターの破線
+    ribbon(pts, -ROAD + 0.15, -ROAD + 0.3, 0.06, gfn, "白", "白線")
+    ribbon(pts, ROAD - 0.3, ROAD - 0.15, 0.06, gfn, "白", "白線")
+    dv, df = [], []
+    for i in range(0, len(pts) - 4, 8):
+        seg = pts[i:i + 4]
+        for j, (x, y) in enumerate(seg):
+            a, b = seg[max(j - 1, 0)], seg[min(j + 1, len(seg) - 1)]
+            tl = math.hypot(b[0] - a[0], b[1] - a[1]) or 1.0
+            rx, ry = (b[1] - a[1]) / tl, -(b[0] - a[0]) / tl
+            for w in (-0.07, 0.07):
+                px, py = x + rx * w, y + ry * w
+                dv.append((px, py, gfn(px, py) + 0.06))
+            if j:
+                k_ = len(dv) - 2
+                df.append((k_ - 2, k_ - 1, k_ + 1, k_))
+    mesh_obj("センターライン", dv, df, M("黄線"))
+    # 谷側（左）のガードレールと支柱、山側（右）の岩の壁
+    wall(pts, -(ROAD + 0.9), 0.12, 0.75, gfn, "ガードレール", name="ガードレール")
+    posts = Batch("ガードレールの支柱")
+    for i in range(0, len(pts), 4):
+        x, y = pts[i]
+        a, b = pts[max(i - 1, 0)], pts[min(i + 1, len(pts) - 1)]
+        tl = math.hypot(b[0] - a[0], b[1] - a[1]) or 1.0
+        lx, ly = -(b[1] - a[1]) / tl, (b[0] - a[0]) / tl
+        px, py = x + lx * (ROAD + 1.0), y + ly * (ROAD + 1.0)
+        posts.box((px * K, py * K, (gfn(px, py) + 0.3) * K), (0.1 * K, 0.1 * K, 0.8 * K), M("ガードレール"))
+    posts.build()
+    wall(pts, ROAD + 1.6, 1.2, 3.5, gfn, "岩", name="岩の壁")
+    # 木（谷側と山側）と遠くの山
+    leaf1 = bpy.data.materials.get("葉1") or mat("葉1", (0.08, 0.25, 0.08, 1), 0.9)
+    leaf2 = bpy.data.materials.get("葉2") or mat("葉2", (0.12, 0.3, 0.1, 1), 0.9)
+    trunk = bpy.data.materials.get("幹") or mat("幹", (0.25, 0.17, 0.1, 1), 0.9)
+    hill = bpy.data.materials.get("丘") or mat("丘", (0.28, 0.4, 0.25, 1), 1.0)
+    rnd = _r.Random(5)
+    trees = Batch("木")
+    n_ok = 0
+    for _ in range(4000):
+        if n_ok > 650:
+            break
+        x, y = rnd.uniform(-170, 270), rnd.uniform(-220, 220)
+        s_, d = near(x, y)
+        if abs(d) < ROAD + 4.0 or s_ <= 0.5 or s_ >= S[-1] - 0.5:
+            continue
+        z = gfn(x, y)
+        h = rnd.uniform(6, 13)
+        trees.cyl((x * K, y * K, z * K), 0.18 * K, h * 0.3 * K, trunk, n=5)
+        trees.cyl((x * K, y * K, (z + h * 0.22) * K), h * 0.3 * K, h * 0.8 * K, leaf1 if n_ok % 2 else leaf2, n=7, r2=0.0)
+        n_ok += 1
+    trees.build()
+    far = Batch("遠くの山")
+    for k_ in range(14):
+        a = math.radians(-60 + k_ * 16)
+        r_ = rnd.uniform(380, 520)
+        cx, cy = 50 + r_ * math.cos(a), r_ * math.sin(a)
+        far.cyl((cx * K, cy * K, -60 * K), rnd.uniform(90, 160) * K, rnd.uniform(80, 150) * K, hill, n=9, r2=0.0)
+    far.build()
+
+    # ---- 車: 主役 R32（ドリフト）と、前を走ってスピンするテスタロッサ
+    path = course(pts, fn=gfn)
+    car_setup(path, g, start_speed=98, top_speed=108, speed_scale=1.0)
+    s.drive = "RWD"
+    s.drift = True
+    s.drift_angle = 32
+    s.drift_r_start = 400                        # R400 より曲がっていればドリフト、R160 で最大 → このコースではずっと最大
+    s.drift_r_full = 160
+    s.drift_freq = 1.1                           # 切り返し（フェイント）を素早く
+    s.line_hold = 1.5                            # 曲がり易さ（下で道からはみ出さない所まで上げる）
+    s.rollover_auto = False
+    s.spin = False
+    s.spin_dir = "RIGHT"
+    s.spin_kick = 70                             # 小さなきっかけ（いきなり回さない）
+    s.spin_grip = 0.35                           # 後輪のグリップが抜けて、テールが流れて回り出す
+    s.spin_steer = -0.35                         # カウンターを当てながら回る（内側へ巻き込まず、勢いのまま外へ流れる）
+    s.use_skid = s.use_smoke = True
+    s.smoke_amount = 1.0
+    s.use_multi = True
+    s.use_walls = True                           # ガードレール・岩の壁を突き抜けない
+    s.wall_collection = bpy.data.collections.get("壁")
+    AHEAD = 18                                   # テスタロッサは 18 m 前から（車間を詰める）
+    p2 = course(pts[AHEAD:], "走行ライン2", fn=gfn)
+    b2, w2 = dup_car((pts[AHEAD][0], pts[AHEAD][1], 0), None, model="TESTA")
+    it2 = add_car(b2, w2, p2, lane_offset=0.8, speed_mult=1.0, start_speed=98, overtake=False, avoid=False)
+    it2.spin = False
+    bake()
+    spin_at = (45 + 45 * math.cos(math.radians(112)), 45 * math.sin(math.radians(112)))   # コーナーの半ばを過ぎた所
+    it2.spin_frame = frame_near(b2, spin_at, 1, F)
+    it2.spin = True
+
+    def hull(b_):
+        Mi = b_.matrix_world.inverted()
+        xs, ys = [], []
+        for o in b_.children_recursive:
+            if o.type == 'MESH' and not o.hide_render:
+                for c in o.bound_box:
+                    p_ = Mi @ (o.matrix_world @ Vector(c))
+                    xs.append(p_.x)
+                    ys.append(p_.y)
+        return min(xs), max(xs), min(ys), max(ys)
+
+    def corners(b_, h_):
+        Mx = b_.matrix_world
+        return [(Mx @ Vector((x, y, 0))).xy for x, y in ((h_[0], h_[2]), (h_[1], h_[2]), (h_[1], h_[3]), (h_[0], h_[3]))]
+
+    def seg_d(p_, a, b):
+        ab = b - a
+        t = max(0.0, min(1.0, (p_ - a).dot(ab) / max(1e-9, ab.dot(ab))))
+        return (p_ - (a + ab * t)).length
+
+    def inside(p_, poly):
+        c = False
+        for i in range(4):
+            a, b = poly[i], poly[(i + 1) % 4]
+            if (a.y > p_.y) != (b.y > p_.y) and p_.x < (b.x - a.x) * (p_.y - a.y) / (b.y - a.y) + a.x:
+                c = not c
+        return c
+
+    def rect_dist(A, B):
+        if any(inside(p_, B) for p_ in A) or any(inside(p_, A) for p_ in B):
+            return 0.0
+        return min(min(seg_d(p_, B[i], B[(i + 1) % 4]) for p_ in A for i in range(4)),
+                   min(seg_d(p_, A[i], A[(i + 1) % 4]) for p_ in B for i in range(4)))
+
+    h1 = hull(body)
+    h2 = hull(b2)
+
+    def closest():
+        best = (1e9, 0)
+        for f in range(1, F + 1):
+            sc.frame_set(f)
+            d = rect_dist(corners(body, h1), corners(b2, h2))
+            if d < best[0]:
+                best = (d, f)
+        return best
+
+    EDGE = ROAD - 0.35                            # タイヤの中心がここより外へ出ないように
+    wheels2 = list(wheels)
+
+    def wheel_excess():
+        """道のりごとに、主役のタイヤが道の端から出た量（左が +、右が -）"""
+        ex = np.zeros(len(S))
+        for f in range(1, F + 1):
+            sc.frame_set(f)
+            for w in wheels2:
+                q = w.matrix_world.translation
+                s_, d = near(q.x / K, q.y / K)
+                i = int(np.searchsorted(S, s_))
+                i = min(i, len(S) - 1)
+                over = d - EDGE if d > EDGE else (d + EDGE if d < -EDGE else 0.0)
+                if abs(over) > abs(ex[i]):
+                    ex[i] = over
+        return ex
+
+    def smooth_push(ex):
+        """はみ出しを打ち消す横ずれ（前後になだらかに広げる）"""
+        out = np.zeros(len(S))
+        for i in np.nonzero(ex)[0]:
+            w = np.exp(-((S - S[i]) / 14.0) ** 2)
+            cand = -ex[i] * 1.15 * w
+            out = np.where(np.abs(cand) > np.abs(out), cand, out)
+        return out
+
+    GAP = 0.55                                    # 狙うすき間（m）
+    A, s_c, side = 0.0, None, -1.0
+    corr = np.zeros(len(S))
+    for it in range(12):
+        bake()
+        gap, fm = closest()
+        ex = wheel_excess()
+        sc.frame_set(fm)
+        hp, sp_ = body.matrix_world.translation, b2.matrix_world.translation
+        s_h, _ = near(hp.x / K, hp.y / K)
+        _, d_sp = near(sp_.x / K, sp_.y / K)
+        print("DODGE iter", it, "gap %.2f m at frame %d" % (gap, fm), "spinner lateral %.2f" % d_sp, "A %.2f" % A,
+              "wheel out max %.2f" % float(np.max(np.abs(ex))))
+        ok_gap = 0.3 < gap < 0.85                 # 「間一髪」と言える範囲（これより寄せると壁に当たって外れる）
+        ok_edge = float(np.max(np.abs(ex))) < 0.05
+        print("DODGE   handling line_hold %.1f max_steer %.0f corner_use %.2f" % (s.line_hold, s.max_steer, s.corner_use))
+        if s_c is not None and ok_gap and ok_edge:
+            break
+        if not ok_edge:
+            # 道からはみ出す → 走行ラインは動かさず、車の曲がり易さで直す
+            if s.line_hold < 3.0:
+                s.line_hold = min(3.0, s.line_hold + 0.5)
+            elif s.max_steer < 38:
+                s.max_steer = min(38.0, s.max_steer + 3)
+        if s_c is None:
+            s_c = s_h
+        if not ok_gap:
+            # スピンした車の方（毎回いまの位置で判断）へ: すき間が大きければ寄る、小さければ離れる
+            tw = 1.0 if d_sp >= 0 else -1.0
+            A += tw * (gap - GAP) * 0.8 if gap > 0 else -tw * 0.6
+            A = max(-(ROAD - 1.2), min(ROAD - 1.2, A))
+        new = []
+        for i, (x, y) in enumerate(pts):
+            u = (S[i] - s_c)
+            w = 0.0
+            if -45 < u < 30:
+                w = math.cos(math.pi / 2 * (u / (45 if u < 0 else 30))) ** 2
+            off = A * w
+            new.append((x - TY[i] * off, y + TX[i] * off))
+        # 走行ラインの点を書き換える（オブジェクトを作り直して消すと、焼き込みが消えた物を読んで落ちる）
+        for p_, (x, y) in zip(s.path.data.splines[0].points, new):
+            p_.co = (x * K, y * K, gfn(x, y) * K, 1.0)
+        s.path.data.update_tag()
+        bpy.context.view_layer.update()
+    else:
+        bake()      # 最後に直した走行ラインで焼き込み直す
+    print("DODGE final gap %.2f m at frame %d" % (gap, fm))
+    sc["dodge_gap"] = gap
+    trk = car_tracks([body, b2], 1, F)
+    a = chase_cam("カメラA_追いかけ", body, 1, F, dist=8.5, height=4.6, side=-1.8, smooth=0.16)   # 谷側の上から（山側は岩の壁）
+    sp_ = None
+    sc.frame_set(fm)
+    mid = (body.matrix_world.translation + b2.matrix_world.translation) / 2 / K
+    s_m, _ = near(mid.x, mid.y)
+    i_m = int(np.searchsorted(S, s_m))
+    zr = gfn(mid.x, mid.y)                      # すれ違う所の路面の高さ
+    lx, ly = -TY[i_m], TX[i_m]                   # 左（谷側）
+    fx, fy = TX[i_m], TY[i_m]                    # 進む向き
+    # スピンした車のいる側の反対（木の無い側）から撮る。山側なら岩の壁の上、谷側ならガードレールの外
+    _, d_spin = near(b2.matrix_world.translation.x / K, b2.matrix_world.translation.y / K)
+    sgn = -1.0 if d_spin > 0 else 1.0            # +1: 谷側（左）、-1: 山側（右）
+    ox = sgn * (7.5 if sgn < 0 else 8.0)
+    cx, cy = mid.x + lx * ox + fx * 14.0, mid.y + ly * ox + fy * 14.0
+    b = fixed_cam("カメラB_すれ違い", (cx, cy, zr + (5.2 if sgn < 0 else 2.6) - gfn(cx, cy)), body, 1, F, lens=30, smooth=0.25)
+    # C（リプレイ）: 同じ側の路肩の低い所、すれ違いの真横から
+    ox = sgn * 5.3
+    rx, ry = mid.x + lx * ox - fx * 2.0, mid.y + ly * ox - fy * 2.0
+    c = fixed_cam("カメラC_リプレイ", (rx, ry, zr + 1.0 - gfn(rx, ry)), body, 1, F, lens=24, smooth=0.5)
+    cut = max(40, fm - 32)
+    finish("スピンした車を間一髪でかわす", "峠の下り ／ 前のテスタロッサがスピン、S2000 がドリフトのまますり抜ける",
+           [(a, 1, cut), (b, cut + 1, F)], (c, fm - 22, fm + 14, 0.3))
+
+
+def scene_formula_race():
+    """フォーミュラ 20台のレース: 高速コーナーが続くコース（メインストレート → 右 R220 → 左 R180 → 右 R260）"""
+    import random
+    pick("FORMULA")
+    rng = random.Random(20)
+    F = 300
+    sc.frame_start, sc.frame_end = 1, F
+    ROAD = 7.0
+
+    # ---- コース（亀の歩き方で: 直線と、半径・角度を決めた円弧をつなぐ）
+    def turtle(segs, x=0.0, y=-320.0, hd=90.0, step=2.0):
+        out = [(x, y)]
+        for sg in segs:
+            if sg[0] == "S":
+                n = max(1, int(sg[1] / step))
+                for _ in range(n):
+                    x += math.cos(math.radians(hd)) * sg[1] / n
+                    y += math.sin(math.radians(hd)) * sg[1] / n
+                    out.append((x, y))
+            else:
+                r, ang = sg[1], sg[2]                       # ang: + 左、- 右
+                n = max(2, int(abs(math.radians(ang)) * r / step))
+                for _ in range(n):
+                    h0 = hd
+                    hd += ang / n
+                    hm = math.radians((h0 + hd) / 2)
+                    ln = 2 * r * math.sin(abs(math.radians(ang / n)) / 2)
+                    x += math.cos(hm) * ln
+                    y += math.sin(hm) * ln
+                    out.append((x, y))
+        return out
+    pts = turtle([("S", 330), ("C", 220, -95), ("S", 70), ("C", 180, 80), ("S", 50), ("C", 260, -65), ("S", 260)])
+    xs, ys = [p_[0] for p_ in pts], [p_[1] for p_ in pts]
+    gc = ((min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2)
+    gsz = max(max(xs) - min(xs), max(ys) - min(ys)) + 240
+    g = ground(None, gsz, gc, subdiv=200, material="芝")
+    ribbon(pts, -ROAD, ROAD, 0.03)
+    ribbon(pts, -ROAD + 0.2, -ROAD + 0.4, 0.045, None, "白", "白線")
+    ribbon(pts, ROAD - 0.4, ROAD - 0.2, 0.045, None, "白", "白線")
+    # 曲がっている所だけ縁石
+    S_ = [0.0]
+    for a_, b_ in zip(pts, pts[1:]):
+        S_.append(S_[-1] + math.dist(a_, b_))
+
+    def curv(i):
+        a_, b_, c_ = pts[max(0, i - 2)], pts[i], pts[min(len(pts) - 1, i + 2)]
+        h1 = math.atan2(b_[1] - a_[1], b_[0] - a_[0])
+        h2 = math.atan2(c_[1] - b_[1], c_[0] - b_[0])
+        return abs((h2 - h1 + math.pi) % (2 * math.pi) - math.pi)
+    i = 0
+    while i < len(pts) - 1:
+        if curv(i) > 0.004:
+            j = i
+            while j < len(pts) - 1 and curv(j) > 0.004:
+                j += 1
+            kerbs(pts[i:j + 1], ROAD, ROAD + 1.2, 3)
+            kerbs(pts[i:j + 1], -ROAD - 1.2, -ROAD, 3)
+            i = j
+        i += 1
+
+    def offset(d):
+        out = []
+        for k_, (x, y) in enumerate(pts):
+            a_, b_ = pts[max(k_ - 1, 0)], pts[min(k_ + 1, len(pts) - 1)]
+            tl = math.hypot(b_[0] - a_[0], b_[1] - a_[1]) or 1.0
+            lx, ly = -(b_[1] - a_[1]) / tl, (b_[0] - a_[0]) / tl
+            out.append((x + lx * d, y + ly * d))
+        return out
+
+    def from_s(p_list, s0):
+        k_ = next(k for k in range(len(S_)) if S_[k] >= s0)
+        return p_list[k_:]
+
+    # ---- 20台の団子（振り付け）: 位置と向きはここで決めてキーを打ち、サスペンション・タイヤ・ハンドルだけ物理で付ける
+    # （物理で走らせると、高速コーナーで車ごとに外へはらむ量が違い、詰めた集団では当たってしまうため）
+    N = 20
+    S_LEAD = 230.0                               # 先頭は 1コーナー（330 m）の 100 m 手前
+    LANE = 3.6                                   # 横に動ける範囲（中心から ±）
+    FPS_ = sc.render.fps / sc.render.fps_base
+    DT = 1.0 / FPS_
+    TX_ = [(pts[min(k + 1, len(pts) - 1)][0] - pts[max(k - 1, 0)][0], pts[min(k + 1, len(pts) - 1)][1] - pts[max(k - 1, 0)][1])
+           for k in range(len(pts))]
+    TX_ = [(a_ / (math.hypot(a_, b_) or 1.0), b_ / (math.hypot(a_, b_) or 1.0)) for a_, b_ in TX_]
+
+    def at_s(sv):
+        """道のり sv の中心線の位置・進む向き（単位ベクトル）"""
+        sv = max(0.0, min(S_[-1] - 1e-3, sv))
+        lo, hi = 0, len(S_) - 1
+        while hi - lo > 1:
+            mid_ = (lo + hi) // 2
+            if S_[mid_] <= sv:
+                lo = mid_
+            else:
+                hi = mid_
+        u = (sv - S_[lo]) / max(1e-6, S_[hi] - S_[lo])
+        x = pts[lo][0] + (pts[hi][0] - pts[lo][0]) * u
+        y = pts[lo][1] + (pts[hi][1] - pts[lo][1]) * u
+        tx = TX_[lo][0] + (TX_[hi][0] - TX_[lo][0]) * u
+        ty = TX_[lo][1] + (TX_[hi][1] - TX_[lo][1]) * u
+        tl = math.hypot(tx, ty) or 1.0
+        return x, y, tx / tl, ty / tl
+
+    # 速さ: 曲がりの強さから決める（直線 290 km/h、コーナーは横 1.6 G、加速 7 m/s²、減速 14 m/s²）
+    # curv(k) は前後 2点ずつ離れた 2本の線の向きの差 → その間の距離（前後の半分）で割ると曲率
+    kap = [curv(k) / max(1e-6, 0.5 * (S_[min(k + 2, len(S_) - 1)] - S_[max(k - 2, 0)])) for k in range(len(pts))]
+    vmax = [min(290 / 3.6, math.sqrt(1.6 * 9.8 / max(kk, 1e-6))) for kk in kap]
+    for k in range(1, len(vmax)):
+        vmax[k] = min(vmax[k], math.sqrt(vmax[k - 1] ** 2 + 2 * 7.0 * (S_[k] - S_[k - 1])))
+    for k in range(len(vmax) - 2, -1, -1):
+        vmax[k] = min(vmax[k], math.sqrt(vmax[k + 1] ** 2 + 2 * 14.0 * (S_[k + 1] - S_[k])))
+
+    def v_at(sv):
+        k = max(0, min(len(S_) - 1, int(sv / 2.0)))
+        while k + 1 < len(S_) and S_[k + 1] < sv:
+            k += 1
+        while k > 0 and S_[k] > sv:
+            k -= 1
+        return vmax[k]
+    base = [S_LEAD]                              # 先頭の道のり（フレームごと）
+    for _ in range(F):
+        base.append(base[-1] + v_at(base[-1]) * DT)
+
+    def plan(back, prm):
+        """車 1台ぶんの (x, y, ヨー) をフレームごとに"""
+        lat0, la, ll, lp, lb, lbl, lbp, pa, pt, pp = prm
+        out = []
+        for fi in range(F + 1):
+            sv = base[fi] - back + pa * math.sin(2 * math.pi * fi * DT / pt + pp)
+            d_ = lat0 + la * math.sin(2 * math.pi * sv / ll + lp) + lb * math.sin(2 * math.pi * sv / lbl + lbp)
+            d_ = max(-LANE, min(LANE, d_))
+            x, y, tx, ty = at_s(sv)
+            out.append([sv, d_, x - ty * d_, y + tx * d_, tx, ty])
+        for fi in range(F + 1):                  # 向き: 進む向き（前後のフレームの位置の差）
+            a_ = out[max(0, fi - 1)]
+            b_ = out[min(F, fi + 1)]
+            out[fi].append(math.atan2(b_[3] - a_[3], b_[2] - a_[2]))
+        return out
+
+    def clear(pl, plans):
+        for pl2 in plans:
+            for fi in range(0, F + 1, 2):
+                a_, b_ = pl[fi], pl2[fi]
+                dx, dy = b_[2] - a_[2], b_[3] - a_[3]
+                h = a_[6]
+                fx, fy = math.cos(h), math.sin(h)
+                lon = dx * fx + dy * fy
+                lat = -dx * fy + dy * fx
+                if abs(lon) < 6.6 and abs(lat) < 2.4:          # 車 5.8×2.0 ＋ すき間
+                    return False
+        return True
+
+    def rand_prm():
+        return (rng.uniform(-2.9, 2.9), rng.uniform(0.4, 1.4), rng.uniform(180, 420), rng.uniform(0, 6.28),
+                rng.uniform(0.0, 0.4), rng.uniform(70, 130), rng.uniform(0, 6.28),
+                rng.uniform(0.5, 3.5), rng.uniform(5.0, 12.0), rng.uniform(0, 6.28))   # 前後の浮き沈み（抜きつ抜かれつ）
+    plans, backs = [], []
+    back = 0.0
+    tries_total = 0
+    for q in range(N):
+        extra = 0.0
+        for _try in range(800):
+            if _try and _try % 200 == 0:
+                extra += 2.5
+            gap = 0.0 if q == 0 else rng.choice((0.0, 1.5, 3.0, 4.5, 6.0, 7.5)) + extra
+            prm = rand_prm()
+            pl = plan(back + gap, prm)
+            if clear(pl, plans):
+                break
+        tries_total += _try
+        back += gap
+        backs.append(back)
+        plans.append(pl)
+    print("FORMULA choreography placed", N, "cars, pack length %.1f m, tries %d" % (back + 5.8, tries_total))
+
+    car_setup(course(pts), g, start_speed=200, top_speed=300, mu=2.0, corner_use=0.7)
+    s.mass, s.accel, s.brake = 800, 9.0, 16.0
+    s.max_steer = 40
+    s.use_skid = s.use_smoke = False
+    s.use_multi = False
+    s.drive_mode = "KEYED"
+    z0 = body.matrix_world.translation.z
+    cars = [body]
+    whs = [list(wheels)]
+    for q in range(1, N):
+        b2, w2 = dup_car((0, 0, 0), None, model="FORMULA")
+        cars.append(b2)
+        whs.append(list(w2))
+    for q, b_ in enumerate(cars):
+        b_["cpb_wheels"] = [w.name for w in whs[q]]     # 後の整理（organize_ref.py）で車として見つけられるように
+        tree = [b_] + list(b_.children_recursive) + whs[q]
+        hue = 0.0 if q == 0 else ((q * 0.161) % 1.0) - 0.5
+        for o in tree:
+            if o.type == 'MESH':
+                o["cpb_livery"] = float(q % 3)
+                o["cpb_hue"] = hue
+    # 振り付けのキーを打って、1台ずつ「手付けに後付け」で焼き込む
+    bpy.context.view_layer.update()
+    wrel = [[b_.matrix_world.inverted() @ w.matrix_world for w in whs[q]] for q, b_ in enumerate(cars)]   # ボディから見たホイールの位置
+    for q, b_ in enumerate(cars):
+        b_.animation_data_clear()
+        b_.rotation_mode = 'XYZ'
+        for fi in range(F + 1):
+            sv, d_, x, y, tx, ty, h = plans[q][fi]
+            b_.location = (x * K, y * K, z0)
+            b_.rotation_euler = (0.0, 0.0, h - math.pi / 2)
+            b_.keyframe_insert("location", frame=1 + fi)
+            b_.keyframe_insert("rotation_euler", frame=1 + fi)
+        for w in whs[q]:
+            w.animation_data_clear()
+    unwrap = [None] * N
+    for q, b_ in enumerate(cars):
+        fc = [c for c in b_.animation_data.action.fcurves if c.data_path == "rotation_euler" and c.array_index == 2][0]
+        prev = None
+        for kp in fc.keyframe_points:             # ヨーの角度が ±180° で跳ばないように
+            if prev is not None:
+                while kp.co.y - prev > math.pi:
+                    kp.co.y -= 2 * math.pi
+                while kp.co.y - prev < -math.pi:
+                    kp.co.y += 2 * math.pi
+            prev = kp.co.y
+            kp.interpolation = 'LINEAR'
+        for c in b_.animation_data.action.fcurves:
+            for kp in c.keyframe_points:
+                kp.interpolation = 'LINEAR'
+    for q, b_ in enumerate(cars):
+        s.body = b_
+        s.wheel_fl, s.wheel_fr, s.wheel_rl, s.wheel_rr = whs[q]
+        # 焼き込みは今の姿勢を「基準（ボディとホイールの位置関係）」として読むので、
+        # 1フレーム目でホイールをボディの横に戻してから焼く（戻さないと、ホイールが元の場所に取り残される）
+        sc.frame_set(1)
+        for w, rm in zip(whs[q], wrel[q]):
+            w.matrix_world = b_.matrix_world @ rm
+        for o in [b_] + whs[q]:
+            for key in [k_ for k_ in o.keys() if k_.startswith("cpb_") and k_ not in ("cpb_wheels", "cpb_livery", "cpb_hue")]:
+                del o[key]
+        bpy.context.view_layer.update()
+        bake()
+        # 上下動はほぼ消す（ダウンフォースの無い計算なので、1.6 G で曲がると車体が大きく浮いてしまう）。
+        # 傾き・ハンドル・タイヤの回転は焼き込みのまま
+        for fc_ in b_.animation_data.action.fcurves:
+            if fc_.data_path == "location" and fc_.array_index == 2:
+                for kp in fc_.keyframe_points:
+                    kp.co.y = z0 + max(-0.015, min(0.015, (kp.co.y - z0) * 0.05))
+                    kp.handle_left.y = kp.handle_right.y = kp.co.y
+                fc_.update()
+    s.body = cars[0]
+    s.wheel_fl, s.wheel_fr, s.wheel_rl, s.wheel_rr = whs[0]
+    mid = cars[9]
+    # 見せ場: 1コーナー（右 R220）の頂点あたり
+    k_apex = next(k for k in range(len(S_)) if S_[k] >= 330 + 220 * math.radians(47))
+    ax, ay = pts[k_apex]
+    k_2 = next(k for k in range(len(S_)) if S_[k] >= 330 + 220 * math.radians(95) + 70 + 180 * math.radians(40))
+    bx, by = pts[k_2]
+    dress_generic(pts, ROAD + 1.2, None, car_tracks(cars[::3], 1, F, 4), (ax, ay), F, gc, gsz, seed=29, white=False)
+    f_a = frame_near(mid, (ax, ay), 1, F)
+    f_b = frame_near(mid, (bx, by), 1, F)
+    a = chase_cam("カメラA_集団の後ろ", mid, 1, F, dist=26, height=10, side=0.0, lens=35, smooth=0.08)
+    # 1コーナーの外側から、頂点へ流れ込む集団を望遠で
+    k_o = max(0, k_apex - 25)
+    ox, oy = offset(ROAD + 16)[k_o]
+    b = fixed_cam("カメラB_高速コーナー", (ox, oy, 3.5), mid, 1, F, lens=60, smooth=0.3)
+    d_ = chase_cam("カメラD_集団の中", cars[6], 1, F, dist=7.5, height=1.3, side=2.6, lens=28, smooth=0.12)
+    c = chase_cam("カメラC_上空", cars[4], 1, F, dist=16, height=30, side=-10.0, lens=40, smooth=0.06, look=6.0)
+    t1 = max(30, f_a - 40)
+    t2 = min(F - 90, f_a + 30)
+    t3 = max(t2 + 30, min(F - 30, f_b - 10))
+    finish("フォーミュラ 20台のレース", "高速コーナーが続くコースを、20台が団子で駆け抜ける",
+           [(a, 1, t1), (b, t1 + 1, t2), (d_, t2 + 1, t3), (c, t3 + 1, F)], None)
+
+
+def scene_bridge_swap():
+    """V コン: 橋の上を 3台が競る（3拍）→ 主塔が画面を横切る間に、全車フォーミュラに入れ替わる（1拍）→ 余韻（2拍）"""
+    pick("R32")
+    FPS_ = 30
+    sc.render.fps, sc.render.fps_base = FPS_, 1.0
+    BPM = 140
+    BEAT = FPS_ * 60.0 / BPM
+    T0 = 8                                       # 1拍目のフレーム
+    beats = [T0 + BEAT * i for i in range(7)]
+    F = int(round(beats[6])) + 6
+    sc.frame_start, sc.frame_end = 1, F
+    V = 200 / 3.6                                # 200 km/h のまま
+    Y0 = 0.0                                     # 主役の 1フレーム目の位置
+    MATS["鋼板"] = mat("鋼板", (0.32, 0.33, 0.35, 1), 0.3)
+    MATS["水面"] = mat("水面", (0.08, 0.16, 0.2, 1), 0.08)
+    # 継ぎ目（段差）: 主役がちょうど拍で越える所。少し手前から車体が跳ねるように、拍の 2フレーム前の位置
+    joints = [Y0 + V * ((b - 2 - 1) / FPS_) + 1.3 for b in beats[:6]]
+
+    def road_z(y):
+        z = 0.0
+        for jy in joints:                        # 継ぎ目: 鋼板が 5cm 盛り上がり、後ろが 3cm 落ちる
+            d = y - jy
+            if -0.3 < d < 0.3:
+                z += 0.05
+            elif 0.3 <= d < 2.5:
+                z -= 0.03 * (1.0 - (d - 0.3) / 2.2)
+        return z
+    ys = []
+    y = -80.0
+    while y <= 420.0:
+        ys.append(round(y, 3))
+        fine = any(-0.6 < y - jy < 2.8 for jy in joints)
+        y += 0.05 if fine else 0.5
+    ys = sorted(set(ys))
+
+    def matn(y):
+        return "鋼板" if any(abs(y - jy) < 0.3 for jy in joints) else "アスファルト"
+    g = strip_mesh("橋の路面", ys, -7.0, 7.0, road_z, matn)
+    for xl in (-2.0, 2.0):                      # 3車線の区切り（破線）
+        for y0 in range(-70, 410, 12):
+            ribbon(line((xl, y0), (xl, y0 + 6), 1.0), -0.08, 0.08, 0.006, lambda x, y: road_z(y), "白", "車線")
+    for xo in (-6.4, 6.4):
+        ribbon(line((xo, -80), (xo, 420), 0.5), -0.08, 0.08, 0.006, lambda x, y: road_z(y), "白", "外側線")
+    side = line((0, -80), (0, 420), 2.0)
+    wall(side, 7.0, 0.4, 0.9, None, "コンクリート", name="高欄")
+    wall(side, -7.0, 0.4, 0.9, None, "コンクリート", name="高欄")
+    box_obj("桁", (0, 170, -1.0), (14.6, 500, 1.8), M("コンクリート"))
+    for yy in range(-60, 421, 90):
+        box_obj("橋脚", (0, yy, -8.5), (3.0, 4.0, 13.0), M("コンクリート"))
+    bpy.ops.mesh.primitive_plane_add(size=1600 * K, location=(0, 200 * K, -14.5 * K))
+    bpy.context.object.data.materials.append(M("水面"))
+    for yy in range(-60, 421, 40):
+        for xo in (-7.4, 7.4):
+            box_obj("照明柱", (xo, yy, 4.5), (0.18, 0.18, 9.0), M("ガードレール"))
+            box_obj("照明", (xo * 0.85, yy, 9.0), (2.4, 0.3, 0.2), M("ガードレール"))
+    # ---- 3台: 主役 R32（左の車線）、S2000（右の車線・少し前）、テスタロッサ（右の車線・後ろ）
+    LANE_L, LANE_M, LANE_R = -4.0, 0.0, 4.0     # 3台はそれぞれ別の車線（抜く時に重ならない）
+    path = course(line((LANE_L, Y0 - 20), (LANE_L, 420), 2.0))
+    car_setup(path, g, start_speed=200, top_speed=200)
+    s.top_speed = 200
+    s.use_multi = True
+    s.use_skid = s.use_smoke = False
+    others = []
+    for model, lane, dy, sm in (("S2000", LANE_M, -6.0, 1.07), ("TESTA", LANE_R, 7.0, 0.94)):
+        b2, w2 = dup_car((0, 0, 0), None, model=model)
+        add_car(b2, w2, course(line((lane, Y0 - 20 + dy), (lane, 420), 2.0), "走行ライン_" + model),
+                start_speed=200 * sm, speed_mult=sm, overtake=False, avoid=False)
+        others.append((b2, w2))
+    bake()
+    normals = [(body, list(wheels))] + [(b_, list(w_)) for b_, w_ in others]
+    # 主役の位置からカメラと主塔を決める
+    SWAP = int(round(beats[3] + BEAT * 0.5))     # 4拍目の真ん中で入れ替える（主塔が画面をふさぐ瞬間）
+    track = []
+    for f in range(1, F + 1):
+        sc.frame_set(f)
+        track.append(body.matrix_world.translation.copy())
+    CAM_X, CAM_DY, CAM_Z = LANE_L - 7.2, -0.5, 5.2     # 高欄の外 5.2 m の高さから見下ろす（奥の車線の車が手前の車に隠れない）
+    TOWER_X = LANE_L - 4.3                       # 主塔はカメラと主役の間（高欄のすぐ外）
+    TOWER_W = 13.0
+    y_sw = track[SWAP - 1].y / K + CAM_DY
+    m_tw = mat("主塔", (0.012, 0.016, 0.06, 1), 0.6)       # 濃紺（画面をすっきりふさぐ）
+    tower = box_obj("主塔", (TOWER_X - 0.6, y_sw, 12.0), (1.2, TOWER_W, 30.0), m_tw)
+    box_obj("主塔の梁", (0.0, y_sw, 21.0), (16.0, TOWER_W * 0.6, 2.5), m_tw)
+    box_obj("主塔", (-TOWER_X + 0.6, y_sw, 12.0), (1.2, TOWER_W, 30.0), m_tw)
+    cd = bpy.data.cameras.new("カメラA_横付け")
+    cd.lens = 30                                 # 30mm 固定
+    cd.clip_start = 0.3
+    cd.clip_end = 900
+    cam = link(bpy.data.objects.new("カメラA_横付け", cd))
+    import random as _r
+    rr = _r.Random(30)
+    ph = [rr.uniform(0, 6.28) for _ in range(9)]
+
+    def shake(fr, amp):
+        tt = fr / FPS_
+        return (amp * (0.6 * math.sin(2 * math.pi * 1.7 * tt + ph[0]) + 0.4 * math.sin(2 * math.pi * 4.3 * tt + ph[1])),
+                amp * (0.6 * math.sin(2 * math.pi * 1.3 * tt + ph[2]) + 0.4 * math.sin(2 * math.pi * 3.7 * tt + ph[3])),
+                amp * (0.5 * math.sin(2 * math.pi * 2.1 * tt + ph[4]) + 0.5 * math.sin(2 * math.pi * 5.3 * tt + ph[5])))
+    ys_ = None
+    for f in range(1, F + 1):
+        p_ = track[f - 1] / K
+        ys_ = p_.y if ys_ is None else ys_ + (p_.y - ys_) * 0.6
+        # 拍ごとに少し揺れを足す（段差を越える瞬間に合わせて）
+        kick = 0.0
+        for b_ in beats[:6]:
+            dtb = f - b_
+            if 0 <= dtb < 8:
+                kick = max(kick, math.exp(-dtb / 2.5))
+        amp = 0.06 + 0.10 * kick
+        sx, sy, sz = shake(f, amp)
+        cam.location = Vector((CAM_X + sx, ys_ + CAM_DY + sy, CAM_Z + sz)) * K
+        aim = Vector((LANE_L + 1.2, ys_ + 0.3, 0.45)) * K
+        rot = (aim - cam.location).to_track_quat('-Z', 'Y').to_euler()
+        rx, ry, rz = shake(f + 37, math.radians(0.45 + 0.6 * kick))
+        cam.rotation_euler = (rot.x + rx, rot.y + ry, rot.z + rz)
+        cam.keyframe_insert("location", frame=f)
+        cam.keyframe_insert("rotation_euler", frame=f)
+    # ---- フォーミュラ 3台: 元の車の位置・向きを受け継いで（手付けに後付けで）焼き込み、入れ替わった後だけ見せる
+    s.use_multi = False
+    s.cars.clear()
+    formulas = []
+    # フォーミュラ: 元の車の物理の動き（上下・傾き）を半分の強さで写す（固めの車）。
+    # ホイールは車体と一緒に動かし、高さだけ路面に合わせ、進んだ距離ぶん回す
+    FIRM = 0.5
+    for q, (nb, nw) in enumerate(normals):
+        fb, fw = dup_car((0, 0, 0), None, model="FORMULA")
+        bpy.context.view_layer.update()
+        wrel = [fb.matrix_world.inverted() @ w.matrix_world for w in fw]
+        rads = [max(w.dimensions.y, w.dimensions.z) / 2 for w in fw]
+        z0f = fb.matrix_world.translation.z
+        for o in [fb] + list(fw):
+            o.animation_data_clear()
+            o.rotation_mode = 'XYZ'
+        sc.frame_set(1)
+        zn0 = nb.matrix_world.translation.z
+        dist = 0.0
+        prev = None
+        for fr in range(1, F + 1):
+            sc.frame_set(fr)
+            Mn = nb.matrix_world
+            en = Mn.to_euler('XYZ')
+            p_ = Mn.translation
+            fb.location = (p_.x, p_.y, z0f + (p_.z - zn0) * FIRM)
+            fb.rotation_euler = (en.x * FIRM, en.y * FIRM, en.z)
+            fb.keyframe_insert("location", frame=fr)
+            fb.keyframe_insert("rotation_euler", frame=fr)
+            if prev is not None:
+                dist += (p_.xy - prev).length
+            prev = p_.xy.copy()
+            Mf = Matrix.LocRotScale(Vector(fb.location), fb.rotation_euler.to_quaternion(), Vector((1, 1, 1)))
+            for w, rm, rad in zip(fw, wrel, rads):
+                Mw = Mf @ rm
+                loc = Mw.translation
+                w.location = (loc.x, loc.y, rad + road_z(loc.y / K) * K)
+                w.rotation_euler = (-dist / rad, 0.0, en.z)
+                w.keyframe_insert("location", frame=fr)
+                w.keyframe_insert("rotation_euler", frame=fr)
+        for o in [fb] + list(fw):
+            for c in o.animation_data.action.fcurves:
+                for kp in c.keyframe_points:
+                    kp.interpolation = 'LINEAR'
+        hue = (0.0, 0.33, -0.28)[q]
+        for o in [fb] + list(fb.children_recursive) + list(fw):
+            if o.type == 'MESH':
+                o["cpb_livery"] = float(q % 3)
+                o["cpb_hue"] = hue
+        fb["cpb_wheels"] = [w.name for w in fw]
+        formulas.append((fb, fw))
+    for nb, nw in normals:
+        nb["cpb_wheels"] = [w.name for w in nw]
+
+    def vis_key(objs, show_before):
+        for o in objs:
+            if o.type != 'MESH':
+                continue
+            for fr, hide in ((1, not show_before), (SWAP, show_before)):
+                o.hide_render = hide
+                o.hide_viewport = False
+                o.keyframe_insert("hide_render", frame=fr)
+            for c in o.animation_data.action.fcurves:
+                if c.data_path == "hide_render":
+                    for kp in c.keyframe_points:
+                        kp.interpolation = 'CONSTANT'
+    for nb, nw in normals:
+        vis_key([nb] + list(nb.children_recursive) + list(nw), True)
+    for fb, fw in formulas:
+        vis_key([fb] + list(fb.children_recursive) + list(fw), False)
+    # 主役（cpb の本体）は R32 に戻しておく
+    s.drive_mode = "PATH"
+    s.body = body
+    s.wheel_fl, s.wheel_fr, s.wheel_rl, s.wheel_rr = wheels
+    sc["vcon"] = json.dumps({"bpm": BPM, "beats": beats, "swap": SWAP, "fps": FPS_})
+    print("SWAP frame", SWAP, "beats", [round(b, 1) for b in beats], "joints", [round(j, 1) for j in joints])
+    finish("V コン: 橋の上の入れ替わり", "3拍は普通の車が競り、4拍目に主塔が横切ると全車フォーミュラに",
+           [(cam, 1, F)], None)
+
+
 SCENES = {
-    "27_drift_jump": scene_drift_jump,
+    "27_drift_jump": scene_drift_jump, "28_spin_dodge": scene_spin_dodge, "29_formula_race": scene_formula_race, "30_bridge_swap": scene_bridge_swap,
     "01_chicane_roll": scene_chicane_roll, "02_spin_barrier": scene_spin_barrier,
     "03_wall_scrape": scene_wall_scrape, "04_multi_crash": scene_multi_crash,
     "05_drift_battle": scene_drift_battle, "06_touge_rail": scene_touge_rail,

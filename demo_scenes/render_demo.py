@@ -8,6 +8,8 @@ sc = bpy.context.scene
 for mk in list(sc.timeline_markers):
     sc.timeline_markers.remove(mk)
 sc.render.resolution_x, sc.render.resolution_y = 1280, 720
+if os.environ.get("CPB_SKY") == "1":    # 確認用: 背景の透過を切って空も写す
+    sc.render.film_transparent = False
 sc.render.resolution_percentage = pct
 meta = json.loads(sc["demo"])
 tasks = []

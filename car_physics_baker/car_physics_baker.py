@@ -359,6 +359,7 @@ class Params:
     spin_dir = 0                     # 0=自動, 1=左, -1=右
     spin_kick = math.radians(90)
     spin_grip = 0.6
+    spin_steer = 0.6                   # スピン中の前輪の舵（+ で回る向きへ切る、- でカウンター）
     # 横転（剛体モード）
     rollover = False
     rollover_frame = 0
@@ -954,6 +955,10 @@ def simulate(path, P, wheels, radii, n_frames, fps, height_fn=None, inputs=None,
         # ---- スピン開始 ----
         if P.spin and not spinning and f >= P.spin_frame:
             spinning = True
+            # ドリフトの見た目の角度を本当の向きに移す。速度は車体の向きで持っているので、
+            # 逆に回して、進んでいる向き（世界での速度）は変えない（いきなり内側へ曲がらない）
+            cb_, sb_ = math.cos(beta), math.sin(beta)
+            vx, vy = vx * cb_ + vy * sb_, -vx * sb_ + vy * cb_
             psi += beta
             beta = beta_v = 0.0
             psi_v = psi
@@ -1024,7 +1029,7 @@ def simulate(path, P, wheels, radii, n_frames, fps, height_fn=None, inputs=None,
         if spinning:
             Fdrive = 0.0
             Fbrake = m * P.brake * 0.4
-            delta_cmd = spin_sign * P.max_steer * 0.6
+            delta_cmd = spin_sign * P.max_steer * P.spin_steer
             rear_lock = True
             brake_front_bias = 1.0
             mu_r = gr_mu * P.spin_grip
@@ -1928,11 +1933,25 @@ if bpy is not None:
             return 1.0 - _clamp(w, 0.0, 1.0) * (1.0 - low)
         return fn
 
+    def _coll_objs(coll):
+        """コレクションと子コレクションのオブジェクト。all_objects は消したオブジェクトが一覧に残って
+        Blender が落ちることがあるので使わない"""
+        out, seen = [], set()
+        stack = [coll]
+        while stack:
+            c = stack.pop()
+            for o in c.objects:
+                if o.name not in seen:
+                    seen.add(o.name)
+                    out.append(o)
+            stack.extend(c.children)
+        return out
+
     def _wall_fns(coll, depsgraph):
         """コレクション内のメッシュを壁にする。面の表（法線）側が道路側"""
         bm = bmesh.new()
         n = 0
-        for o in coll.all_objects:
+        for o in _coll_objs(coll):
             if o.type != 'MESH':
                 continue
             ev = o.evaluated_get(depsgraph)
@@ -2037,7 +2056,7 @@ if bpy is not None:
     def _barrier_tires(s):
         if not s.use_barrier or s.barrier_collection is None:
             return []
-        return [o for o in s.barrier_collection.all_objects if o.type == 'MESH']
+        return [o for o in _coll_objs(s.barrier_collection) if o.type == 'MESH']
 
     # タイヤの断面（半径, 高さ）。外径 0.62 m・幅 0.2 m の古タイヤ（ホイールなし）。
     # 平らなトレッドに縦溝 2 本、角の丸いショルダー、ふくらんだサイドウォール、内側はビード（穴）
@@ -3271,7 +3290,7 @@ if bpy is not None:
     def _part_objects(s):
         if s.parts_collection is None:
             return []
-        return [o for o in s.parts_collection.all_objects if o.parent is not None]
+        return [o for o in _coll_objs(s.parts_collection) if o.parent is not None]
 
     def _restore_parts(s):
         for o in _part_objects(s):
@@ -3447,7 +3466,7 @@ if bpy is not None:
     def _jiggle_objects(s):
         if not s.use_jiggle or s.jiggle_collection is None:
             return []
-        return [o for o in s.jiggle_collection.all_objects]
+        return [o for o in _coll_objs(s.jiggle_collection)]
 
     # ---------------- テイク ----------------
 
@@ -3623,6 +3642,8 @@ if bpy is not None:
             ("AUTO", "自動", "曲がっている方向へ"), ("LEFT", "左", ""), ("RIGHT", "右", "")])
         spin_kick: FloatProperty(name="きっかけ (°/s)", default=90.0, min=0.0, max=720.0)
         spin_grip: FloatProperty(name="後輪グリップ倍率", default=0.6, min=0.05, max=1.0)
+        spin_steer: FloatProperty(name="スピン中のハンドル", default=0.6, min=-1.0, max=1.0,
+                                  description="スピン中の前輪の切れ角（最大舵角に対する割合）。+ は回る向きへ切る（内側へ巻き込む）、- はカウンター（外へ流れながら回る）")
 
         # 横転
         rollover: BoolProperty(name="横転", default=False,
@@ -3900,6 +3921,7 @@ if bpy is not None:
         P.spin_dir = {"AUTO": 0, "LEFT": 1, "RIGHT": -1}[s.spin_dir]
         P.spin_kick = math.radians(s.spin_kick)
         P.spin_grip = s.spin_grip
+        P.spin_steer = s.spin_steer
         P.rollover = s.rollover
         P.rollover_frame = s.rollover_frame - f0
         P.rollover_dir = {"AUTO": 0, "LEFT": -1, "RIGHT": 1}[s.rollover_dir]
@@ -4362,10 +4384,10 @@ if bpy is not None:
 
         # ---- トレーラー ----
         if s.use_trailer:
-            if s.trailer_body is None or s.trailer_wheels is None or not len(s.trailer_wheels.all_objects):
+            if s.trailer_body is None or s.trailer_wheels is None or not len(_coll_objs(s.trailer_wheels)):
                 raise _BakeError("トレーラー: 荷台と、タイヤのコレクションを指定してください")
             tb = _Tgt(s.trailer_body)
-            tws = [_Tgt(o) for o in s.trailer_wheels.all_objects]
+            tws = [_Tgt(o) for o in _coll_objs(s.trailer_wheels)]
             for t_ in [tb] + tws:
                 if not t_.has_rest():
                     t_.capture()
@@ -4586,7 +4608,7 @@ if bpy is not None:
             if s.trailer_body is not None:
                 objs.append(s.trailer_body)
             if s.trailer_wheels is not None:
-                objs += list(s.trailer_wheels.all_objects)
+                objs += list(_coll_objs(s.trailer_wheels))
             for o in objs:
                 _remove_keys(o)
                 if o == s.body:
@@ -4601,7 +4623,7 @@ if bpy is not None:
                         continue
                 if REST_KEY in o:
                     o.matrix_world = _list_to_mat(list(o[REST_KEY]))
-            _restore_barrier([o for o in (s.barrier_collection.all_objects if s.barrier_collection else [])
+            _restore_barrier([o for o in (_coll_objs(s.barrier_collection) if s.barrier_collection else [])
                               if o.type == 'MESH'])
             old = bpy.data.objects.get(BARRIER_PROXY)
             if old is not None:
@@ -4721,7 +4743,7 @@ if bpy is not None:
                 self.report({'ERROR'}, "バリヤのタイヤのコレクションがありません")
                 return {'CANCELLED'}
             n = 0
-            for o in col.all_objects:
+            for o in _coll_objs(col):
                 if o.type != 'MESH' or not _is_old_tire_mesh(o.data):
                     continue
                 try:
@@ -4945,7 +4967,7 @@ if bpy is not None:
                     continue
                 if prop not in s.body:
                     s.body[prop] = 0.0
-                for o in coll.all_objects:
+                for o in _coll_objs(coll):
                     if o.type != 'MESH':
                         continue
                     if not o.data.materials:
@@ -4993,7 +5015,7 @@ if bpy is not None:
             for coll in (s.brake_lights, s.reverse_lights):
                 if coll is None:
                     continue
-                for o in coll.all_objects:
+                for o in _coll_objs(coll):
                     if o.type != 'MESH':
                         continue
                     for m in o.data.materials:
@@ -5203,6 +5225,7 @@ if bpy is not None:
                 box.row().prop(s, "spin_dir", expand=True)
                 box.prop(s, "spin_kick")
                 box.prop(s, "spin_grip")
+                box.prop(s, "spin_steer")
             box = L.box()
             box.prop(s, "rollover", icon='ORIENTATION_GIMBAL')
             if s.rollover:

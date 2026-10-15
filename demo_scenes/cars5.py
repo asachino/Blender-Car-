@@ -11,8 +11,10 @@ import bpy
 from mathutils import Vector
 
 SCENE = "CPB_READY_5車種"
-KEYS = {"R32": "R32", "S2000": "S2000", "F40": "F40", "Countach": "COUNTACH", "Testarossa": "TESTA"}
-NAME = {"R32": "R32", "S2000": "S2000", "F40": "F40", "COUNTACH": "カウンタック", "TESTA": "テスタロッサ"}
+KEYS = {"R32": "R32", "S2000": "S2000", "F40": "F40", "Countach": "COUNTACH", "Testarossa": "TESTA",
+        "Formula": "FORMULA"}        # Formula は cars6.blend（add_formula.py で足したもの）にだけある
+NAME = {"R32": "R32", "S2000": "S2000", "F40": "F40", "COUNTACH": "カウンタック", "TESTA": "テスタロッサ",
+        "FORMULA": "フォーミュラ"}
 
 # 車ごとの性格（物理の設定）
 PHYS = {
@@ -21,6 +23,7 @@ PHYS = {
     "F40": dict(drive="RWD", mass=1100, front_weight=0.42, cg_height=0.40),
     "COUNTACH": dict(drive="RWD", mass=1450, front_weight=0.42, cg_height=0.43),
     "TESTA": dict(drive="RWD", mass=1510, front_weight=0.41, cg_height=0.44),
+    "FORMULA": dict(drive="RWD", mass=800, front_weight=0.45, cg_height=0.30),
 }
 
 
